@@ -20,7 +20,6 @@ static char *id = "alsav";
 static bool enable = 1;
 
 static struct timer_list timer;
-static bool timer_enable = 0;
 
 module_param(index, int, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard");
@@ -32,7 +31,8 @@ MODULE_PARM_DESC(enable, "Enable " CARD_NAME " soundcard.");
 struct alsav {
 	struct snd_pcm_substream *substream;
 	struct snd_pcm *pcm;
-	unsigned long position;
+	size_t buf_pos;
+	size_t period_pos;
 	struct platform_device *pdev;
 	struct snd_card *card;
 };
@@ -58,7 +58,7 @@ static struct snd_pcm_hardware snd_alsav_playback_hw = {
 
 static struct snd_pcm_hardware snd_alsav_capture_hw = {
 	.info = (SNDRV_PCM_INFO_INTERLEAVED |
-		 SNDRV_PCM_INFO_BLOCK_TRANSFER | //?
+		 SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		 SNDRV_PCM_INFO_MMAP_VALID),
 	.formats =		SNDRV_PCM_FMTBIT_S16_LE,
 	.rates =		SNDRV_PCM_RATE_8000,
@@ -75,7 +75,6 @@ static struct snd_pcm_hardware snd_alsav_capture_hw = {
 
 static int snd_alsav_playback_open(struct snd_pcm_substream *substream)
 {
-	//struct alsav *alsav = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	runtime->hw = snd_alsav_playback_hw;
@@ -84,23 +83,29 @@ static int snd_alsav_playback_open(struct snd_pcm_substream *substream)
 
 static int snd_alsav_playback_close(struct snd_pcm_substream *substream)
 {
-	//struct alsav *alsav = snd_pcm_substream_chip(substream);
 	return 0;
 }
 
 void timer_timeout(struct timer_list *data)
 {
 	struct snd_pcm_runtime *runtime;
+	size_t b_read;
+
 	if (!alsav->substream)
 		return;
 	runtime = alsav->substream->runtime;
-	alsav->position += runtime->dma_bytes / TIMER_PER_SEC;
-	alsav->position %= frames_to_bytes(runtime, runtime->buffer_size);
-	if (alsav->position % frames_to_bytes(runtime, 1) == 0)
+	// We want to record RATE samples per sec, it is rate * sample_bytes
+	b_read = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC;
+	alsav->buf_pos += b_read;
+	alsav->buf_pos %= frames_to_bytes(runtime, runtime->buffer_size);
+	alsav->period_pos += b_read;
+
+	if (alsav->period_pos >= frames_to_bytes(runtime, runtime->period_size)){
+		alsav->period_pos %= frames_to_bytes(runtime, runtime->period_size);
 		snd_pcm_period_elapsed(alsav->substream);
-	if (timer_enable) {
-		mod_timer(&timer, jiffies + TIMER_INTERVAL);
 	}
+
+	mod_timer(&timer, jiffies + TIMER_INTERVAL);
 }
 
 static int snd_alsav_capture_open(struct snd_pcm_substream *substream)
@@ -110,12 +115,9 @@ static int snd_alsav_capture_open(struct snd_pcm_substream *substream)
 
 	runtime->hw = snd_alsav_capture_hw;
 	alsav->substream = substream;
-	alsav->position = 0;
+	alsav->buf_pos = 0;
+	alsav->period_pos = 0;
 
-
-	timer_enable = 1;
-	del_timer(&timer);
-	timer_setup(&timer, timer_timeout, 0);
 	mod_timer(&timer, jiffies + TIMER_INTERVAL);
 	return 0;
 }
@@ -123,7 +125,6 @@ static int snd_alsav_capture_open(struct snd_pcm_substream *substream)
 static int snd_alsav_capture_close(struct snd_pcm_substream *substream)
 {
 	struct alsav *alsav = snd_pcm_substream_chip(substream);
-	timer_enable = 0;
 	alsav->substream = NULL;
 	return 0;
 }
@@ -145,19 +146,19 @@ static int snd_alsav_pcm_prepare(struct snd_pcm_substream *substream)
 
 static int snd_alsav_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	pr_info("Area: %p len: %zd\n", substream->runtime->dma_area, substream->runtime->dma_bytes);
+	pr_info("Area: %p len: %zd 1 period: %ld\n", substream->runtime->dma_area, substream->runtime->dma_bytes,
+						substream->runtime->period_size);
 	get_random_bytes(substream->runtime->dma_area, substream->runtime->dma_bytes);
 	return 0;
 }
 
 static snd_pcm_uframes_t snd_alsav_pcm_pointer(struct snd_pcm_substream *substream)
 {
-	return bytes_to_frames(substream->runtime, alsav->position);
+	return bytes_to_frames(substream->runtime, alsav->buf_pos);
 }
 
 static int snd_alsav_free(struct alsav *alsav)
 {
-	timer_enable = 0;
 	if (!alsav)
 		return 0;
 	if (alsav->card)
@@ -168,7 +169,6 @@ static int snd_alsav_free(struct alsav *alsav)
 
 static int snd_alsav_dev_free(struct snd_device *device)
 {
-	//return snd_alsav_free(device->device_data);
 	return 0;
 }
 
@@ -223,7 +223,8 @@ static int snd_alsav_create(struct snd_card *card, struct platform_device *pdev,
 		return -ENOMEM;
 	alsav->card = card;
 	alsav->pdev = pdev;
-	alsav->position = 0;
+	alsav->buf_pos = 0;
+	alsav->period_pos = 0;
 
 	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, alsav, &ops);
 	if (err < 0) {
@@ -240,7 +241,8 @@ static int alsav_probe(struct platform_device *pdev)
 {
 	struct snd_card *card;
 	int err;
-	pr_info("Probe\n");
+
+	timer_setup(&timer, timer_timeout, 0);
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (err) {
@@ -261,7 +263,7 @@ static int alsav_probe(struct platform_device *pdev)
 
 	strcpy(card->driver, "Virtual chip");
 	strcpy(card->shortname, "VChip v0.1");
-	strcpy(card->longname, "VirtualChip MegaSuperDuperHarosh v0.0010101");
+	strcpy(card->longname, "VirtualChip v0.1");
 
 	err = snd_card_register(card);
 	if (err < 0) {
@@ -278,6 +280,7 @@ err1:
 
 static int pdev_remove(struct platform_device *dev)
 {
+	timer_shutdown(&timer);
 	snd_alsav_free(alsav);
 	return 0;
 }
