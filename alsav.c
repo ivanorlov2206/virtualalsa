@@ -153,13 +153,8 @@ static void fill_buffer_pattern(void *buf, size_t bytes)
 	}
 }
 
-static int snd_alsav_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+static void fill_buffer(struct snd_pcm_runtime *runtime)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	pr_info("Area: %p len: %zd 1 period: %ld\n", runtime->dma_area, runtime->dma_bytes,
-		runtime->period_size);
-	alsav->period_bytes = frames_to_bytes(runtime, runtime->period_size);
-	alsav->b_read = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC;
 	switch (fill_mode) {
 	case FILL_MODE_RAND:
 		fill_buffer_rand(runtime->dma_area, runtime->dma_bytes);
@@ -171,6 +166,24 @@ static int snd_alsav_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	default:
 		fill_buffer_seq(runtime->dma_area, runtime->dma_bytes);
 		break;
+	}
+}
+
+static int snd_alsav_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	pr_info("Area: %p len: %zd 1 period: %ld\n", runtime->dma_area, runtime->dma_bytes,
+		runtime->period_size);
+	alsav->period_bytes = frames_to_bytes(runtime, runtime->period_size);
+	alsav->b_read = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC;
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		fill_buffer(runtime);
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+		break;
+	default:
+		return -EINVAL;
 	}
 	return 0;
 }
@@ -229,7 +242,7 @@ static int snd_alsav_new_pcm(struct alsav *alsav)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_alsav_playback_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_alsav_capture_ops);
 
-	err = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &alsav->pdev->dev, 8 * 1024, 16 * 1024);
+	err = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &alsav->pdev->dev, 16 * 1024, 32 * 1024);
 	return 0;
 }
 
@@ -299,6 +312,10 @@ err1:
 	return err;
 }
 
+static void alsav_pdev_release(struct device *dev)
+{
+}
+
 static int pdev_remove(struct platform_device *dev)
 {
 	snd_alsav_free(alsav);
@@ -307,6 +324,7 @@ static int pdev_remove(struct platform_device *dev)
 
 static struct platform_device alsav_pdev = {
 	.name =		"alsav",
+	.dev.release =	alsav_pdev_release,
 };
 
 static struct platform_driver alsav_pdrv = {
