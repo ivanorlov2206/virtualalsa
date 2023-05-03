@@ -1,3 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ALSA virtual driver
+ *
+ * Copyright 2023 Ivan Orlov <ivan.orlov0322@gmail.com>
+ *
+ * This is a simple virtual ALSA driver, aimed to ALSA middle layer testing.
+ * It can:
+ *	- Simulate 'playback' and 'capture' actions
+ *	- Generate random or pattern-based capture data
+ *	- Check playback buffer for containing looped and monotonically increasing sequence of
+ *	bytes (0, 1, 2, ..., FF, 0, 1, 2, ...), and notify about the results through the debugfs
+ *      entry
+ *	- Register custom RESET ioctl and notify when it is called through the debugfs entry
+ *
+ * You can find the corresponding selftest in the 'alsa' selftests folder.
+ *
+ * Also it can be used as a template for other virtual drivers.
+ */
+
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
@@ -17,13 +37,11 @@
 #define DEVNAME "alsavd"
 #define CARD_NAME "virtualcard"
 #define TIMER_PER_SEC 5
-#define TIMER_INTERVAL HZ / TIMER_PER_SEC
+#define TIMER_INTERVAL (HZ / TIMER_PER_SEC)
 
 #define FILL_MODE_RAND	0
 #define FILL_MODE_SEQ	1
 #define FILL_MODE_PAT	2
-
-#define GET_PLAYBACK_RES_IOCTL 10
 
 static int index = -1;
 static char *id = "alsav";
@@ -34,7 +52,8 @@ static char *fill_pattern = "abacaba";
 
 static struct timer_list timer;
 
-static u8 playback_capture_test = 0;
+static u8 playback_capture_test;
+static u8 ioctl_reset_test;
 static struct dentry *driver_debug_dir;
 
 module_param(index, int, 0444);
@@ -43,9 +62,9 @@ module_param(id, charp, 0444);
 MODULE_PARM_DESC(id, "ID string for " CARD_NAME " soundcard");
 module_param(enable, bool, 0444);
 MODULE_PARM_DESC(enable, "Enable " CARD_NAME " soundcard.");
-module_param(fill_mode, short, S_IRUSR | S_IWUSR);
+module_param(fill_mode, short, 0600);
 MODULE_PARM_DESC(fill_mode, "Buffer fill mode: rand(0) or seq(1)");
-module_param(fill_pattern, charp, S_IRUSR | S_IWUSR);
+module_param(fill_pattern, charp, 0600);
 
 struct alsav {
 	struct snd_pcm_substream *substream;
@@ -83,6 +102,8 @@ static struct snd_pcm_hardware snd_alsav_hw = {
 static void check_buf_block(struct alsav *alsav, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
+	u8 current_byte;
+
 	for (i = 0; i < alsav->b_read; i++) {
 		/*
 		 * Set wrong_zero if we found '0' on position where it shouldn't be.
@@ -91,12 +112,12 @@ static void check_buf_block(struct alsav *alsav, struct snd_pcm_runtime *runtime
 		 * If we found any other non-zero byte after wrong placed '0', the buffer
 		 * is corrupted. It is definitely corrupted if we found wrong placed
 		 * non-zero byte
-		*/
-		if (runtime->dma_area[alsav->buf_pos] && (alsav->wrong_zero
-		    || runtime->dma_area[alsav->buf_pos] != alsav->buf_pos % 256)) {
+		 */
+		current_byte = runtime->dma_area[alsav->buf_pos];
+		if (current_byte && (alsav->wrong_zero || current_byte != alsav->buf_pos % 256)) {
 			alsav->is_buf_corrupted = true;
 			break;
-		} else if (!runtime->dma_area[alsav->buf_pos] && alsav->buf_pos % 256 != 0) {
+		} else if (!current_byte && alsav->buf_pos % 256 != 0) {
 			alsav->wrong_zero = true;
 		}
 		alsav->buf_pos++;
@@ -106,6 +127,11 @@ static void check_buf_block(struct alsav *alsav, struct snd_pcm_runtime *runtime
 	alsav->buf_pos %= runtime->dma_bytes;
 }
 
+/*
+ * Here we iterate through the buffer by (buffer_size / iterates_per_second) bytes.
+ * We need it to simulate the hardware pointer moving, and notify the PCM middle layer about
+ * period elapsed.
+ */
 static void timer_timeout(struct timer_list *data)
 {
 	struct snd_pcm_runtime *runtime;
@@ -141,6 +167,7 @@ static int snd_alsav_pcm_open(struct snd_pcm_substream *substream)
 	alsav->period_pos = 0;
 
 	playback_capture_test = 0;
+	ioctl_reset_test = 0;
 
 	timer_shutdown_sync(&timer);
 	timer_setup(&timer, timer_timeout, 0);
@@ -151,6 +178,7 @@ static int snd_alsav_pcm_open(struct snd_pcm_substream *substream)
 static int snd_alsav_pcm_close(struct snd_pcm_substream *substream)
 {
 	struct alsav *alsav = snd_pcm_substream_chip(substream);
+
 	timer_shutdown_sync(&timer);
 	alsav->substream = NULL;
 
@@ -162,9 +190,9 @@ static void fill_buffer_seq(void *buf, size_t bytes)
 {
 	size_t i;
 	u8 *buffer = buf;
-	for (i = 0; i < bytes; i++) {
-		buffer[i] = (u8) (i % 256);
-	}
+
+	for (i = 0; i < bytes; i++)
+		buffer[i] = i % 256;
 }
 
 static void fill_buffer_rand(void *buf, size_t bytes)
@@ -178,9 +206,8 @@ static void fill_buffer_pattern(void *buf, size_t bytes)
 	u8 *buffer = buf;
 	size_t pattern_len = strlen(fill_pattern);
 
-	for (i = 0; i < bytes; i++) {
+	for (i = 0; i < bytes; i++)
 		buffer[i] = fill_pattern[i % pattern_len];
-	}
 }
 
 static void fill_buffer(struct snd_pcm_runtime *runtime)
@@ -199,11 +226,14 @@ static void fill_buffer(struct snd_pcm_runtime *runtime)
 	}
 }
 
+/*
+ * Here we have the dma buffer already initializated, and can either fill it or check it,
+ * depending on the substream mode
+ */
 static int snd_alsav_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	pr_info("Area: %p len: %zd 1 period: %ld\n", runtime->dma_area, runtime->dma_bytes,
-		runtime->period_size);
+
 	alsav->period_bytes = frames_to_bytes(runtime, runtime->period_size);
 	// We want to record RATE samples per sec, it is rate * sample_bytes
 	alsav->b_read = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC;
@@ -233,9 +263,15 @@ static int snd_alsav_free(struct alsav *alsav)
 	return 0;
 }
 
+// These callbacks are required, but empty - all freeing occurs in pdev_remove
 static int snd_alsav_dev_free(struct snd_device *device)
 {
 	return 0;
+}
+
+static void alsav_pdev_release(struct device *dev)
+{
+
 }
 
 static int snd_alsav_pcm_prepare(struct snd_pcm_substream *substream)
@@ -257,15 +293,14 @@ static int snd_alsav_pcm_hw_free(struct snd_pcm_substream *substream)
 static int snd_alsav_ioctl(struct snd_pcm_substream *substream, unsigned int cmd, void *arg)
 {
 	switch (cmd) {
-	case GET_PLAYBACK_RES_IOCTL:
-		u8 *res = arg;
-		*res = !alsav->is_buf_corrupted;
+	case SNDRV_PCM_IOCTL1_RESET:
+		ioctl_reset_test = 1;
 		break;
 	}
 	return snd_pcm_lib_ioctl(substream, cmd, arg);
 }
 
-static struct snd_pcm_ops snd_alsav_playback_ops = {
+static const struct snd_pcm_ops snd_alsav_playback_ops = {
 	.open =		snd_alsav_pcm_open,
 	.close =	snd_alsav_pcm_close,
 	.trigger =	snd_alsav_pcm_trigger,
@@ -276,7 +311,7 @@ static struct snd_pcm_ops snd_alsav_playback_ops = {
 	.pointer =	snd_alsav_pcm_pointer,
 };
 
-static struct snd_pcm_ops snd_alsav_capture_ops = {
+static const struct snd_pcm_ops snd_alsav_capture_ops = {
 	.open =		snd_alsav_pcm_open,
 	.close =	snd_alsav_pcm_close,
 	.trigger =	snd_alsav_pcm_trigger,
@@ -286,32 +321,6 @@ static struct snd_pcm_ops snd_alsav_capture_ops = {
 	.prepare =	snd_alsav_pcm_prepare,
 	.pointer =	snd_alsav_pcm_pointer,
 };
-
-/*static int snd_alsav_testresults_info(struct snd_kcontrol *kcontrol,
-				      struct snd_ctl_elem_info *uinfo)
-{
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
-	uinfo->count = 1;
-	uinfo->value.integer.min = 0;
-	uinfo->value.integer.max = 1;
-	return 0;
-}
-
-static int snd_alsav_testresults_get(struct snd_kcontrol *kcontrol,
-				     struct snd_ctl_elem_value *ucontrol)
-{
-	ucontrol->value.integer.value[0] = !alsav->is_buf_corrupted;
-	return 0;
-}
-
-static struct snd_kcontrol_new test_result_control = {
-	.iface = SNDRV_CTL_ELEM_IFACE_CARD,
-	.name = "Test results",
-	.index = 0,
-	.access = SNDRV_CTL_ELEM_ACCESS_READ,
-	.info = snd_alsav_testresults_info,
-	.get = snd_alsav_testresults_get,
-};*/
 
 static int snd_alsav_new_pcm(struct alsav *alsav)
 {
@@ -342,7 +351,7 @@ static int snd_alsav_create(struct snd_card *card, struct platform_device *pdev,
 	};
 
 	alsav = kzalloc(sizeof(*alsav), GFP_KERNEL);
-	if (alsav == NULL)
+	if (!alsav)
 		return -ENOMEM;
 	alsav->card = card;
 	alsav->pdev = pdev;
@@ -353,10 +362,6 @@ static int snd_alsav_create(struct snd_card *card, struct platform_device *pdev,
 	if (err < 0)
 		goto _err_free_chip;
 
-/*	err = snd_ctl_add(alsav->card, snd_ctl_new1(&test_result_control, alsav));
-	if (err < 0)
-		return err;
-*/
 	err = snd_alsav_new_pcm(alsav);
 	if (err < 0)
 		goto _err_free_chip;
@@ -396,10 +401,6 @@ static int alsav_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void alsav_pdev_release(struct device *dev)
-{
-}
-
 static int pdev_remove(struct platform_device *dev)
 {
 	snd_alsav_free(alsav);
@@ -425,6 +426,7 @@ static int init_debug_files(void)
 	if (!driver_debug_dir)
 		return PTR_ERR(driver_debug_dir);
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
+	debugfs_create_u8("ioctl_test", 0444, driver_debug_dir, &ioctl_reset_test);
 
 	return 0;
 }
