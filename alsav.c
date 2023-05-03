@@ -4,12 +4,15 @@
 #include <linux/fs.h>
 #include <sound/pcm.h>
 #include <sound/core.h>
+#include <sound/control.h>
 #include <sound/initval.h>
 #include <linux/dma-mapping.h>
 #include <linux/platform_device.h>
 #include <linux/timer.h>
+#include <linux/delay.h>
 #include <linux/random.h>
 #include <linux/string.h>
+#include <linux/debugfs.h>
 
 #define DEVNAME "alsavd"
 #define CARD_NAME "virtualcard"
@@ -20,14 +23,19 @@
 #define FILL_MODE_SEQ	1
 #define FILL_MODE_PAT	2
 
+#define GET_PLAYBACK_RES_IOCTL 10
+
 static int index = -1;
 static char *id = "alsav";
 static bool enable = 1;
 
-static short fill_mode = FILL_MODE_RAND;
+static short fill_mode = FILL_MODE_SEQ;
 static char *fill_pattern = "abacaba";
 
 static struct timer_list timer;
+
+static u8 playback_capture_test = 0;
+static struct dentry *driver_debug_dir;
 
 module_param(index, int, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard");
@@ -45,6 +53,8 @@ struct alsav {
 	size_t buf_pos;
 	size_t period_pos;
 	size_t b_read;
+	bool wrong_zero;
+	bool is_buf_corrupted;
 	size_t period_bytes;
 	struct platform_device *pdev;
 	struct snd_card *card;
@@ -69,19 +79,48 @@ static struct snd_pcm_hardware snd_alsav_hw = {
 	.periods_max =		1024,
 };
 
-void timer_timeout(struct timer_list *data)
+// Check one block of the buffer
+static void check_buf_block(struct alsav *alsav, struct snd_pcm_runtime *runtime)
+{
+	size_t i;
+	for (i = 0; i < alsav->b_read; i++) {
+		/*
+		 * Set wrong_zero if we found '0' on position where it shouldn't be.
+		 * It can occur if buffer is corrupted or if we reach its end -
+		 * In second case we can't find any other nums further except '0'
+		 * If we found any other non-zero byte after wrong placed '0', the buffer
+		 * is corrupted. It is definitely corrupted if we found wrong placed
+		 * non-zero byte
+		*/
+		if (runtime->dma_area[alsav->buf_pos] && (alsav->wrong_zero
+		    || runtime->dma_area[alsav->buf_pos] != alsav->buf_pos % 256)) {
+			alsav->is_buf_corrupted = true;
+			break;
+		} else if (!runtime->dma_area[alsav->buf_pos] && alsav->buf_pos % 256 != 0) {
+			alsav->wrong_zero = true;
+		}
+		alsav->buf_pos++;
+		alsav->buf_pos %= runtime->dma_bytes;
+	}
+	alsav->buf_pos += alsav->b_read - i;
+	alsav->buf_pos %= runtime->dma_bytes;
+}
+
+static void timer_timeout(struct timer_list *data)
 {
 	struct snd_pcm_runtime *runtime;
 
 	if (!alsav->substream)
 		return;
 	runtime = alsav->substream->runtime;
-	// We want to record RATE samples per sec, it is rate * sample_bytes
-	alsav->buf_pos += alsav->b_read;
-	alsav->buf_pos %= runtime->dma_bytes;
-	alsav->period_pos += alsav->b_read;
 
-	if (alsav->period_pos >= alsav->period_bytes){
+	if (alsav->substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !alsav->is_buf_corrupted)
+		check_buf_block(alsav, runtime);
+	else
+		alsav->buf_pos = (alsav->buf_pos + alsav->b_read) % runtime->dma_bytes;
+
+	alsav->period_pos += alsav->b_read;
+	if (alsav->period_pos >= alsav->period_bytes) {
 		alsav->period_pos %= alsav->period_bytes;
 		snd_pcm_period_elapsed(alsav->substream);
 	}
@@ -97,7 +136,11 @@ static int snd_alsav_pcm_open(struct snd_pcm_substream *substream)
 	runtime->hw = snd_alsav_hw;
 	alsav->substream = substream;
 	alsav->buf_pos = 0;
+	alsav->wrong_zero = false;
+	alsav->is_buf_corrupted = false;
 	alsav->period_pos = 0;
+
+	playback_capture_test = 0;
 
 	timer_shutdown_sync(&timer);
 	timer_setup(&timer, timer_timeout, 0);
@@ -110,21 +153,8 @@ static int snd_alsav_pcm_close(struct snd_pcm_substream *substream)
 	struct alsav *alsav = snd_pcm_substream_chip(substream);
 	timer_shutdown_sync(&timer);
 	alsav->substream = NULL;
-	return 0;
-}
 
-static int snd_alsav_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *params)
-{
-	return 0;
-}
-
-static int snd_alsav_pcm_hw_free(struct snd_pcm_substream *substream)
-{
-	return 0;
-}
-
-static int snd_alsav_pcm_prepare(struct snd_pcm_substream *substream)
-{
+	playback_capture_test = !alsav->is_buf_corrupted;
 	return 0;
 }
 
@@ -175,10 +205,12 @@ static int snd_alsav_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	pr_info("Area: %p len: %zd 1 period: %ld\n", runtime->dma_area, runtime->dma_bytes,
 		runtime->period_size);
 	alsav->period_bytes = frames_to_bytes(runtime, runtime->period_size);
+	// We want to record RATE samples per sec, it is rate * sample_bytes
 	alsav->b_read = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC;
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		fill_buffer(runtime);
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			fill_buffer(runtime);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		break;
@@ -197,8 +229,6 @@ static int snd_alsav_free(struct alsav *alsav)
 {
 	if (!alsav)
 		return 0;
-	if (alsav->card)
-		snd_card_free(alsav->card);
 	kfree(alsav);
 	return 0;
 }
@@ -208,25 +238,80 @@ static int snd_alsav_dev_free(struct snd_device *device)
 	return 0;
 }
 
+static int snd_alsav_pcm_prepare(struct snd_pcm_substream *substream)
+{
+	return 0;
+}
+
+static int snd_alsav_pcm_hw_params(struct snd_pcm_substream *substream,
+				   struct snd_pcm_hw_params *params)
+{
+	return 0;
+}
+
+static int snd_alsav_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+	return 0;
+}
+
+static int snd_alsav_ioctl(struct snd_pcm_substream *substream, unsigned int cmd, void *arg)
+{
+	switch (cmd) {
+	case GET_PLAYBACK_RES_IOCTL:
+		u8 *res = arg;
+		*res = !alsav->is_buf_corrupted;
+		break;
+	}
+	return snd_pcm_lib_ioctl(substream, cmd, arg);
+}
+
 static struct snd_pcm_ops snd_alsav_playback_ops = {
 	.open =		snd_alsav_pcm_open,
 	.close =	snd_alsav_pcm_close,
+	.trigger =	snd_alsav_pcm_trigger,
 	.hw_params =	snd_alsav_pcm_hw_params,
+	.ioctl =	snd_alsav_ioctl,
 	.hw_free =	snd_alsav_pcm_hw_free,
 	.prepare =	snd_alsav_pcm_prepare,
-	.trigger =	snd_alsav_pcm_trigger,
 	.pointer =	snd_alsav_pcm_pointer,
 };
 
 static struct snd_pcm_ops snd_alsav_capture_ops = {
 	.open =		snd_alsav_pcm_open,
 	.close =	snd_alsav_pcm_close,
+	.trigger =	snd_alsav_pcm_trigger,
 	.hw_params =	snd_alsav_pcm_hw_params,
 	.hw_free =	snd_alsav_pcm_hw_free,
+	.ioctl =	snd_alsav_ioctl,
 	.prepare =	snd_alsav_pcm_prepare,
-	.trigger =	snd_alsav_pcm_trigger,
 	.pointer =	snd_alsav_pcm_pointer,
 };
+
+/*static int snd_alsav_testresults_info(struct snd_kcontrol *kcontrol,
+				      struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 1;
+	return 0;
+}
+
+static int snd_alsav_testresults_get(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = !alsav->is_buf_corrupted;
+	return 0;
+}
+
+static struct snd_kcontrol_new test_result_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_CARD,
+	.name = "Test results",
+	.index = 0,
+	.access = SNDRV_CTL_ELEM_ACCESS_READ,
+	.info = snd_alsav_testresults_info,
+	.get = snd_alsav_testresults_get,
+};*/
 
 static int snd_alsav_new_pcm(struct alsav *alsav)
 {
@@ -242,11 +327,13 @@ static int snd_alsav_new_pcm(struct alsav *alsav)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_alsav_playback_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_alsav_capture_ops);
 
-	err = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &alsav->pdev->dev, 16 * 1024, 32 * 1024);
-	return 0;
+	err = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &alsav->pdev->dev,
+					     16 * 1024, 32 * 1024);
+	return err;
 }
 
-static int snd_alsav_create(struct snd_card *card, struct platform_device *pdev, struct alsav **r_alsav)
+static int snd_alsav_create(struct snd_card *card, struct platform_device *pdev,
+			    struct alsav **r_alsav)
 {
 	struct alsav *alsav;
 	int err;
@@ -263,14 +350,23 @@ static int snd_alsav_create(struct snd_card *card, struct platform_device *pdev,
 	alsav->period_pos = 0;
 
 	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, alsav, &ops);
-	if (err < 0) {
-		snd_alsav_free(alsav);
-		return err;
-	}
+	if (err < 0)
+		goto _err_free_chip;
 
-	snd_alsav_new_pcm(alsav);
+/*	err = snd_ctl_add(alsav->card, snd_ctl_new1(&test_result_control, alsav));
+	if (err < 0)
+		return err;
+*/
+	err = snd_alsav_new_pcm(alsav);
+	if (err < 0)
+		goto _err_free_chip;
+
 	*r_alsav = alsav;
 	return 0;
+
+_err_free_chip:
+	snd_alsav_free(alsav);
+	return err;
 }
 
 static int alsav_probe(struct platform_device *pdev)
@@ -279,37 +375,25 @@ static int alsav_probe(struct platform_device *pdev)
 	int err;
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (err) {
-		pr_info("Can't set mask\n");
-		goto err1;
-	}
+	if (err)
+		return err;
 
-	err = snd_card_new(&pdev->dev, index, id, THIS_MODULE, 0, &card);
-	if (err < 0) {
-		pr_info("Can't create new card\n");
-		goto err1;
-	}
+	err = snd_devm_card_new(&pdev->dev, index, id, THIS_MODULE, 0, &card);
+	if (err < 0)
+		return err;
 	err = snd_alsav_create(card, pdev, &alsav);
-	if (err < 0) {
-		pr_info("Can't create our card instance\n");
-		goto err2;
-	}
+	if (err < 0)
+		return err;
 
 	strcpy(card->driver, "VirtualALSA");
 	strcpy(card->shortname, "VirtualALSA");
 	strcpy(card->longname, "Virtual ALSA card");
 
 	err = snd_card_register(card);
-	if (err < 0) {
-		pr_info("Can't register card\n");
-		goto err2;
-	}
+	if (err < 0)
+		return err;
 
 	return 0;
-err2:
-	snd_card_free(card);
-err1:
-	return err;
 }
 
 static void alsav_pdev_release(struct device *dev)
@@ -335,10 +419,28 @@ static struct platform_driver alsav_pdrv = {
 	},
 };
 
+static int init_debug_files(void)
+{
+	driver_debug_dir = debugfs_create_dir("alsav", NULL);
+	if (!driver_debug_dir)
+		return PTR_ERR(driver_debug_dir);
+	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
+
+	return 0;
+}
+
+static void clear_debug_files(void)
+{
+	debugfs_remove_recursive(driver_debug_dir);
+}
+
 static int __init mod_init(void)
 {
-	int err;
+	int err = 0;
 
+	err = init_debug_files();
+	if (err)
+		return err;
 	err = platform_device_register(&alsav_pdev);
 	if (err)
 		return err;
@@ -350,6 +452,8 @@ static int __init mod_init(void)
 
 static void __exit mod_exit(void)
 {
+	clear_debug_files();
+
 	platform_driver_unregister(&alsav_pdrv);
 	platform_device_unregister(&alsav_pdev);
 }
