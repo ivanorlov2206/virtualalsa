@@ -4,7 +4,7 @@
  *
  * Copyright 2023 Ivan Orlov <ivan.orlov0322@gmail.com>
  *
- * This is a simple virtual ALSA driver, aimed to ALSA middle layer testing.
+ * This is a simple virtual ALSA driver, aimed at the ALSA middle layer testing.
  * It can:
  *	- Simulate 'playback' and 'capture' actions
  *	- Generate random or pattern-based capture data
