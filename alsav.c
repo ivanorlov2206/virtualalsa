@@ -425,7 +425,7 @@ static ssize_t pattern_read(struct file *file, char __user *buff, size_t len, lo
 	if (to_read <= 0)
 		return 0;
 
-	if (copy_to_user(buff + *off, fill_pattern, to_read))
+	if (copy_to_user(buff, fill_pattern + *off, to_read))
 		to_read = 0;
 	else
 		*off += to_read;
