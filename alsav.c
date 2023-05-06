@@ -14,7 +14,8 @@
  *	- Register custom RESET ioctl and notify when it is called through the debugfs entry
  *
  * The driver supports framerates from 8 kHz to 48 kHz, however on the higher framerates it works
- * with delays, so it is better to choose lower framerates (for example, 8 kHz).
+ * with delays, so it is better to choose lower framerates (for example, 8 kHz). At the moment,
+ * only one substream is supported.
  *
  * You can find the corresponding selftest in the 'alsa' selftests folder.
  */
