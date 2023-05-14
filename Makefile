@@ -1,4 +1,4 @@
-obj-m 		:= alsav.o
+obj-m 		:= valsa.o
 KERNELVER 	?= $(shell uname -r)
 KERNELDIR	?= /lib/modules/$(KERNELVER)/build
 
