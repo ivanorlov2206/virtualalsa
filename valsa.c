@@ -37,6 +37,9 @@
 #define TIMER_PER_SEC 5
 #define TIMER_INTERVAL (HZ / TIMER_PER_SEC)
 #define DELAY_JIFFIES HZ
+#define PLAYBACK_SUBSTREAM_CNT	8
+#define CAPTURE_SUBSTREAM_CNT	8
+#define MAX_CHANNELS_NUM	UINT_MAX
 
 #define FILL_MODE_RAND	0
 #define FILL_MODE_PAT	1
@@ -82,10 +85,11 @@ struct valsa {
 	struct platform_device *pdev;
 };
 
-struct valsa_timer {
+struct valsa_buf_iter {
 	size_t buf_pos;
 	size_t period_pos;
 	size_t b_rw;
+	unsigned int sample_bytes;
 	bool is_buf_corrupted;
 	size_t period_bytes;
 	size_t total_bytes;
@@ -99,12 +103,12 @@ static struct snd_pcm_hardware snd_valsa_hw = {
 	.info = (SNDRV_PCM_INFO_INTERLEAVED |
 		 SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		 SNDRV_PCM_INFO_MMAP_VALID),
-	.formats =		SNDRV_PCM_FMTBIT_S16_LE,
+	.formats =		SNDRV_PCM_FMTBIT_U8 | SNDRV_PCM_FMTBIT_S16_LE,
 	.rates =		SNDRV_PCM_RATE_8000_48000,
 	.rate_min =		8000,
 	.rate_max =		48000,
 	.channels_min =		1,
-	.channels_max =		2,
+	.channels_max =		MAX_CHANNELS_NUM,
 	.buffer_bytes_max =	32768,
 	.period_bytes_min =	4096,
 	.period_bytes_max =	32768,
@@ -112,11 +116,11 @@ static struct snd_pcm_hardware snd_valsa_hw = {
 	.periods_max =		1024,
 };
 
-static inline void inc_buf_pos(struct valsa_timer *vtimer, size_t by, size_t bytes)
+static inline void inc_buf_pos(struct valsa_buf_iter *v_iter, size_t by, size_t bytes)
 {
-	vtimer->total_bytes += by;
-	vtimer->buf_pos += by;
-	vtimer->buf_pos %= bytes;
+	v_iter->total_bytes += by;
+	v_iter->buf_pos += by;
+	v_iter->buf_pos %= bytes;
 }
 
 /*
@@ -124,56 +128,66 @@ static inline void inc_buf_pos(struct valsa_timer *vtimer, size_t by, size_t byt
  * necessary because we need to detect when the reading/writing ends, so we assume that the pattern
  * doesn't contain zeros.
  */
-static void check_buf_block(struct valsa_timer *vtimer, struct snd_pcm_runtime *runtime)
+static void check_buf_block(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	u8 current_byte;
 
-	for (i = 0; i < vtimer->b_rw; i++) {
-		current_byte = runtime->dma_area[vtimer->buf_pos];
+	for (i = 0; i < v_iter->b_rw; i++) {
+		current_byte = runtime->dma_area[v_iter->buf_pos];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[vtimer->total_bytes % pattern_len]) {
-			vtimer->is_buf_corrupted = true;
+		if (current_byte != fill_pattern[v_iter->total_bytes % pattern_len]) {
+			v_iter->is_buf_corrupted = true;
 			break;
 		}
-		inc_buf_pos(vtimer, 1, runtime->dma_bytes);
+		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
-	inc_buf_pos(vtimer, vtimer->b_rw - i, runtime->dma_bytes);
+	inc_buf_pos(v_iter, v_iter->b_rw - i, runtime->dma_bytes);
 }
 
-static void fill_block_pattern(struct valsa_timer *vtimer, struct snd_pcm_runtime *runtime)
+// Get the count of bytes written for the current channel. This is count of samples written for the
+// current channel * bytes_in_sample + relative position in the current sample
+static inline size_t pos_in_channel(size_t total_bytes, unsigned int channels,
+				    unsigned int sample_bytes)
+{
+	return total_bytes / channels / sample_bytes * sample_bytes + total_bytes % sample_bytes;
+}
+
+static void fill_block_pattern(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
+	size_t pos_in_ch;
 
-	for (i = 0; i < vtimer->b_rw; i++) {
-		runtime->dma_area[vtimer->buf_pos] = fill_pattern[vtimer->total_bytes
-								  % pattern_len];
-		inc_buf_pos(vtimer, 1, runtime->dma_bytes);
+	for (i = 0; i < v_iter->b_rw; i++) {
+		pos_in_ch = pos_in_channel(v_iter->total_bytes, runtime->channels,
+					   v_iter->sample_bytes);
+		runtime->dma_area[v_iter->buf_pos] = fill_pattern[pos_in_ch % pattern_len];
+		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
 }
 
-static void fill_block_random(struct valsa_timer *vtimer, struct snd_pcm_runtime *runtime)
+static void fill_block_random(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
-	size_t in_cur_block = runtime->dma_bytes - vtimer->buf_pos;
+	size_t in_cur_block = runtime->dma_bytes - v_iter->buf_pos;
 
-	if (vtimer->b_rw <= in_cur_block) {
-		get_random_bytes(&runtime->dma_area[vtimer->buf_pos], vtimer->b_rw);
+	if (v_iter->b_rw <= in_cur_block) {
+		get_random_bytes(&runtime->dma_area[v_iter->buf_pos], v_iter->b_rw);
 	} else {
-		get_random_bytes(&runtime->dma_area[vtimer->buf_pos], in_cur_block);
-		get_random_bytes(runtime->dma_area, vtimer->b_rw - in_cur_block);
+		get_random_bytes(&runtime->dma_area[v_iter->buf_pos], in_cur_block);
+		get_random_bytes(runtime->dma_area, v_iter->b_rw - in_cur_block);
 	}
-	inc_buf_pos(vtimer, vtimer->b_rw, runtime->dma_bytes);
+	inc_buf_pos(v_iter, v_iter->b_rw, runtime->dma_bytes);
 }
 
-static void fill_block(struct valsa_timer *vtimer, struct snd_pcm_runtime *runtime)
+static void fill_block(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	switch (fill_mode) {
 	case FILL_MODE_RAND:
-		fill_block_random(vtimer, runtime);
+		fill_block_random(v_iter, runtime);
 		break;
 	case FILL_MODE_PAT:
-		fill_block_pattern(vtimer, runtime);
+		fill_block_pattern(v_iter, runtime);
 		break;
 	}
 }
@@ -185,82 +199,82 @@ static void fill_block(struct valsa_timer *vtimer, struct snd_pcm_runtime *runti
  */
 static void timer_timeout(struct timer_list *data)
 {
-	struct valsa_timer *vtimer;
+	struct valsa_buf_iter *v_iter;
 	struct snd_pcm_substream *substream;
 
-	vtimer = from_timer(vtimer, data, timer_instance);
-	substream = vtimer->substream;
+	v_iter = from_timer(v_iter, data, timer_instance);
+	substream = v_iter->substream;
 
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !vtimer->is_buf_corrupted)
-		check_buf_block(vtimer, substream->runtime);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && !v_iter->is_buf_corrupted)
+		check_buf_block(v_iter, substream->runtime);
 	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
-		fill_block(vtimer, substream->runtime);
+		fill_block(v_iter, substream->runtime);
 	else
-		inc_buf_pos(vtimer, vtimer->b_rw, substream->runtime->dma_bytes);
+		inc_buf_pos(v_iter, v_iter->b_rw, substream->runtime->dma_bytes);
 
-	vtimer->period_pos += vtimer->b_rw;
-	if (vtimer->period_pos >= vtimer->period_bytes) {
-		vtimer->period_pos %= vtimer->period_bytes;
+	v_iter->period_pos += v_iter->b_rw;
+	if (v_iter->period_pos >= v_iter->period_bytes) {
+		v_iter->period_pos %= v_iter->period_bytes;
 		snd_pcm_period_elapsed(substream);
 	}
 
-	mod_timer(&vtimer->timer_instance, jiffies + TIMER_INTERVAL + inject_delay);
+	mod_timer(&v_iter->timer_instance, jiffies + TIMER_INTERVAL + inject_delay);
 }
 
 static int snd_valsa_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct valsa_timer *vtimer;
+	struct valsa_buf_iter *v_iter;
 
-	vtimer = kzalloc(sizeof(*vtimer), GFP_KERNEL);
-	if (!vtimer)
+	v_iter = kzalloc(sizeof(*v_iter), GFP_KERNEL);
+	if (!v_iter)
 		return -ENOMEM;
 
 	runtime->hw = snd_valsa_hw;
-	runtime->private_data = vtimer;
-	vtimer->substream = substream;
-	vtimer->buf_pos = 0;
-	vtimer->is_buf_corrupted = false;
-	vtimer->period_pos = 0;
-	vtimer->total_bytes = 0;
+	runtime->private_data = v_iter;
+	v_iter->substream = substream;
+	v_iter->buf_pos = 0;
+	v_iter->is_buf_corrupted = false;
+	v_iter->period_pos = 0;
+	v_iter->total_bytes = 0;
 
 	playback_capture_test = 0;
 	ioctl_reset_test = 0;
 
-	timer_setup(&vtimer->timer_instance, timer_timeout, 0);
-	mod_timer(&vtimer->timer_instance, jiffies + TIMER_INTERVAL);
+	timer_setup(&v_iter->timer_instance, timer_timeout, 0);
+	mod_timer(&v_iter->timer_instance, jiffies + TIMER_INTERVAL);
 	return 0;
 }
 
 static int snd_valsa_pcm_close(struct snd_pcm_substream *substream)
 {
-	struct valsa_timer *vtimer = substream->runtime->private_data;
+	struct valsa_buf_iter *v_iter = substream->runtime->private_data;
 
-	timer_shutdown_sync(&vtimer->timer_instance);
-	vtimer->substream = NULL;
-	playback_capture_test = !vtimer->is_buf_corrupted;
-	kfree(vtimer);
+	timer_shutdown_sync(&v_iter->timer_instance);
+	v_iter->substream = NULL;
+	playback_capture_test = !v_iter->is_buf_corrupted;
+	kfree(v_iter);
 	return 0;
 }
 
 static int snd_valsa_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct valsa_timer *vtimer = runtime->private_data;
+	struct valsa_buf_iter *v_iter = runtime->private_data;
 
 	if (inject_trigger_err)
 		return -EINVAL;
-
-	vtimer->period_bytes = frames_to_bytes(runtime, runtime->period_size);
+	v_iter->sample_bytes = runtime->sample_bits / 8;
+	v_iter->period_bytes = frames_to_bytes(runtime, runtime->period_size);
 	// We want to record RATE samples per sec, it is rate * sample_bytes bytes
-	vtimer->b_rw = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC;
+	v_iter->b_rw = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC * runtime->channels;
 	return 0;
 }
 
 static snd_pcm_uframes_t snd_valsa_pcm_pointer(struct snd_pcm_substream *substream)
 {
-	struct valsa_timer *vtimer = substream->runtime->private_data;
-	return bytes_to_frames(substream->runtime, vtimer->buf_pos);
+	struct valsa_buf_iter *v_iter = substream->runtime->private_data;
+	return bytes_to_frames(substream->runtime, v_iter->buf_pos);
 }
 
 static int snd_valsa_free(struct valsa *valsa)
@@ -338,7 +352,8 @@ static int snd_valsa_new_pcm(struct valsa *valsa)
 	struct snd_pcm *pcm;
 	int err;
 
-	err = snd_pcm_new(valsa->card, "VirtualAlsa", 0, 1, 1, &pcm);
+	err = snd_pcm_new(valsa->card, "VirtualAlsa", 0, PLAYBACK_SUBSTREAM_CNT,
+			  CAPTURE_SUBSTREAM_CNT, &pcm);
 	if (err < 0)
 		return err;
 	pcm->private_data = valsa;
