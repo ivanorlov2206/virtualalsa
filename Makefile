@@ -1,4 +1,4 @@
-obj-m 		:= valsa.o
+obj-m 		:= pcmtest.o
 KERNELVER 	?= $(shell uname -r)
 KERNELDIR	?= /lib/modules/$(KERNELVER)/build
 

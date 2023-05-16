@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ALSA virtual driver
+ * Virtual ALSA driver for PCM testing/fuzzing
  *
  * Copyright 2023 Ivan Orlov <ivan.orlov0322@gmail.com>
  *
- * This is a simple virtual ALSA driver, which can be used for audio applications/ALSA middle layer
+ * This is a simple virtual ALSA driver, which can be used for audio applications/PCM middle layer
  * testing or fuzzing.
  * It can:
  *	- Simulate 'playback' and 'capture' actions
@@ -14,9 +14,13 @@
  *	- Inject delays into the playback and capturing processes. See 'inject_delay' parameter.
  *	- Inject errors during the PCM callbacks.
  *	- Register custom RESET ioctl and notify when it is called through the debugfs entry
+ *	- Work in interleaved and non-interleaved modes
+ *	- Support up to 8 substreams
+ *	- Support up to 4 channels
+ *	- Support framerates from 8 kHz to 48 kHz
  *
- * The driver supports framerates from 8 kHz to 48 kHz. At the moment, only one substream
- * is supported.
+ * However, it may break on the higher framerates with small period size, so it is better to choose
+ * larger period sizes.
  *
  * You can find the corresponding selftest in the 'alsa' selftests folder.
  */
@@ -32,14 +36,14 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 
-#define DEVNAME "valsad"
-#define CARD_NAME "virtualcard"
+#define DEVNAME "pcmtstd"
+#define CARD_NAME "pcm-test-card"
 #define TIMER_PER_SEC 5
 #define TIMER_INTERVAL (HZ / TIMER_PER_SEC)
 #define DELAY_JIFFIES HZ
 #define PLAYBACK_SUBSTREAM_CNT	8
 #define CAPTURE_SUBSTREAM_CNT	8
-#define MAX_CHANNELS_NUM	UINT_MAX
+#define MAX_CHANNELS_NUM	4
 
 #define FILL_MODE_RAND	0
 #define FILL_MODE_PAT	1
@@ -47,7 +51,7 @@
 #define MAX_PATTERN_LEN 4096
 
 static int index = -1;
-static char *id = "valsa";
+static char *id = "pcmtst";
 static bool enable = true;
 static int inject_delay;
 static bool inject_hwpars_err;
@@ -79,29 +83,32 @@ MODULE_PARM_DESC(inject_prepare_err, "Inject EINVAL error in the 'prepare' callb
 module_param(inject_trigger_err, bool, 0600);
 MODULE_PARM_DESC(inject_trigger_err, "Inject EINVAL error in the 'trigger' callback");
 
-struct valsa {
+struct pcmtst {
 	struct snd_pcm *pcm;
 	struct snd_card *card;
 	struct platform_device *pdev;
 };
 
-struct valsa_buf_iter {
-	size_t buf_pos;
-	size_t period_pos;
-	size_t b_rw;
-	unsigned int sample_bytes;
-	bool is_buf_corrupted;
-	size_t period_bytes;
-	size_t total_bytes;
+struct pcmtst_buf_iter {
+	size_t buf_pos;				// position in the DMA buffer
+	size_t period_pos;			// period-relative position
+	size_t b_rw;				// Bytes to write on every timer tick
+	unsigned int sample_bytes;		// sample_bits / 8
+	bool is_buf_corrupted;			// playback test result indicator
+	size_t period_bytes;			// bytes in a one period
+	bool interleaved;			// Interleaved/Non-interleaved mode
+	size_t total_bytes;			// Total bytes read/written
+	size_t chan_block;			// Bytes in one channel buffer when non-interleaved
 	struct snd_pcm_substream *substream;
 	struct timer_list timer_instance;
 };
 
-static struct valsa *valsa;
+static struct pcmtst *pcmtst;
 
-static struct snd_pcm_hardware snd_valsa_hw = {
+static struct snd_pcm_hardware snd_pcmtst_hw = {
 	.info = (SNDRV_PCM_INFO_INTERLEAVED |
 		 SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		 SNDRV_PCM_INFO_NONINTERLEAVED |
 		 SNDRV_PCM_INFO_MMAP_VALID),
 	.formats =		SNDRV_PCM_FMTBIT_U8 | SNDRV_PCM_FMTBIT_S16_LE,
 	.rates =		SNDRV_PCM_RATE_8000_48000,
@@ -109,14 +116,14 @@ static struct snd_pcm_hardware snd_valsa_hw = {
 	.rate_max =		48000,
 	.channels_min =		1,
 	.channels_max =		MAX_CHANNELS_NUM,
-	.buffer_bytes_max =	32768,
+	.buffer_bytes_max =	65536,
 	.period_bytes_min =	4096,
 	.period_bytes_max =	32768,
 	.periods_min =		1,
 	.periods_max =		1024,
 };
 
-static inline void inc_buf_pos(struct valsa_buf_iter *v_iter, size_t by, size_t bytes)
+static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t bytes)
 {
 	v_iter->total_bytes += by;
 	v_iter->buf_pos += by;
@@ -128,7 +135,7 @@ static inline void inc_buf_pos(struct valsa_buf_iter *v_iter, size_t by, size_t 
  * necessary because we need to detect when the reading/writing ends, so we assume that the pattern
  * doesn't contain zeros.
  */
-static void check_buf_block(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	u8 current_byte;
@@ -146,28 +153,70 @@ static void check_buf_block(struct valsa_buf_iter *v_iter, struct snd_pcm_runtim
 	inc_buf_pos(v_iter, v_iter->b_rw - i, runtime->dma_bytes);
 }
 
-// Get the count of bytes written for the current channel. This is count of samples written for the
-// current channel * bytes_in_sample + relative position in the current sample
-static inline size_t pos_in_channel(size_t total_bytes, unsigned int channels,
-				    unsigned int sample_bytes)
+// Position in the DMA buffer when we are in the non-interleaved mode (see below)
+static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int channels,
+				  unsigned int chan_num)
 {
-	return total_bytes / channels / sample_bytes * sample_bytes + total_bytes % sample_bytes;
+	return v_iter->buf_pos / channels + v_iter->chan_block * chan_num;
 }
 
-static void fill_block_pattern(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+/*
+ * Fill buffer in the non-interleaved mode. The order of samples is C0, ..., C0, C1, ..., C1, C2...
+ * The channel buffers lay in the DMA buffer continuously (see default copy_user and copy_kernel
+ * handlers in the pcm_lib.c file).
+ *
+ * Here we increment the DMA buffer position every time we write a byte to any channel 'buffer'.
+ * We need this to simulate the correct hardware pointer moving.
+ */
+static void fill_block_pattern_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+{
+	size_t i, j;
+	unsigned int channels = runtime->channels;
+
+	for (i = 0; i < v_iter->b_rw / channels; i++) {
+		for (j = 0; j < channels; j++) {
+			runtime->dma_area[buf_pos_nint(v_iter, channels, j)] =
+				fill_pattern[(v_iter->total_bytes / channels) % pattern_len];
+			inc_buf_pos(v_iter, 1, runtime->dma_bytes);
+		}
+	}
+}
+
+/*
+ * Get the count of bytes written for the current channel in the interleaved mode.
+ * This is (count of samples written for the current channel) * bytes_in_sample +
+ * (relative position in the current sample)
+ */
+static inline size_t ch_pos_int(size_t b_total, unsigned int channels, unsigned int b_sample)
+{
+	return b_total / channels / b_sample * b_sample + b_total % b_sample;
+}
+
+// Fill buffer in the interleaved mode. The order of samples is C0, C1, C2, C0, C1, C2, ...
+static void fill_block_pattern_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	size_t pos_in_ch;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
-		pos_in_ch = pos_in_channel(v_iter->total_bytes, runtime->channels,
-					   v_iter->sample_bytes);
+		pos_in_ch = ch_pos_int(v_iter->total_bytes, runtime->channels,
+				       v_iter->sample_bytes);
+
 		runtime->dma_area[v_iter->buf_pos] = fill_pattern[pos_in_ch % pattern_len];
 		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
 }
 
-static void fill_block_random(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_pattern(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+{
+	if (v_iter->interleaved)
+		fill_block_pattern_int(v_iter, runtime);
+	else
+		fill_block_pattern_nint(v_iter, runtime);
+}
+
+// We can be in either interleaved or non-interleaved modes. The data is random, so we don't care
+static void fill_block_random(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t in_cur_block = runtime->dma_bytes - v_iter->buf_pos;
 
@@ -180,7 +229,7 @@ static void fill_block_random(struct valsa_buf_iter *v_iter, struct snd_pcm_runt
 	inc_buf_pos(v_iter, v_iter->b_rw, runtime->dma_bytes);
 }
 
-static void fill_block(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	switch (fill_mode) {
 	case FILL_MODE_RAND:
@@ -199,7 +248,7 @@ static void fill_block(struct valsa_buf_iter *v_iter, struct snd_pcm_runtime *ru
  */
 static void timer_timeout(struct timer_list *data)
 {
-	struct valsa_buf_iter *v_iter;
+	struct pcmtst_buf_iter *v_iter;
 	struct snd_pcm_substream *substream;
 
 	v_iter = from_timer(v_iter, data, timer_instance);
@@ -221,16 +270,16 @@ static void timer_timeout(struct timer_list *data)
 	mod_timer(&v_iter->timer_instance, jiffies + TIMER_INTERVAL + inject_delay);
 }
 
-static int snd_valsa_pcm_open(struct snd_pcm_substream *substream)
+static int snd_pcmtst_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct valsa_buf_iter *v_iter;
+	struct pcmtst_buf_iter *v_iter;
 
 	v_iter = kzalloc(sizeof(*v_iter), GFP_KERNEL);
 	if (!v_iter)
 		return -ENOMEM;
 
-	runtime->hw = snd_valsa_hw;
+	runtime->hw = snd_pcmtst_hw;
 	runtime->private_data = v_iter;
 	v_iter->substream = substream;
 	v_iter->buf_pos = 0;
@@ -246,9 +295,9 @@ static int snd_valsa_pcm_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static int snd_valsa_pcm_close(struct snd_pcm_substream *substream)
+static int snd_pcmtst_pcm_close(struct snd_pcm_substream *substream)
 {
-	struct valsa_buf_iter *v_iter = substream->runtime->private_data;
+	struct pcmtst_buf_iter *v_iter = substream->runtime->private_data;
 
 	timer_shutdown_sync(&v_iter->timer_instance);
 	v_iter->substream = NULL;
@@ -257,65 +306,73 @@ static int snd_valsa_pcm_close(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static int snd_valsa_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct valsa_buf_iter *v_iter = runtime->private_data;
+	struct pcmtst_buf_iter *v_iter = runtime->private_data;
 
 	if (inject_trigger_err)
 		return -EINVAL;
 	v_iter->sample_bytes = runtime->sample_bits / 8;
 	v_iter->period_bytes = frames_to_bytes(runtime, runtime->period_size);
-	// We want to record RATE samples per sec, it is rate * sample_bytes bytes
+	if (runtime->access == SNDRV_PCM_ACCESS_RW_NONINTERLEAVED ||
+	    runtime->access == SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED) {
+		v_iter->chan_block = runtime->dma_bytes / runtime->channels;
+		v_iter->interleaved = false;
+	} else {
+		v_iter->interleaved = true;
+	}
+	// We want to record RATE * ch_cnt samples per sec, it is rate * sample_bytes * ch_cnt bytes
 	v_iter->b_rw = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC * runtime->channels;
 	return 0;
 }
 
-static snd_pcm_uframes_t snd_valsa_pcm_pointer(struct snd_pcm_substream *substream)
+static snd_pcm_uframes_t snd_pcmtst_pcm_pointer(struct snd_pcm_substream *substream)
 {
-	struct valsa_buf_iter *v_iter = substream->runtime->private_data;
+	struct pcmtst_buf_iter *v_iter = substream->runtime->private_data;
+
 	return bytes_to_frames(substream->runtime, v_iter->buf_pos);
 }
 
-static int snd_valsa_free(struct valsa *valsa)
+static int snd_pcmtst_free(struct pcmtst *pcmtst)
 {
-	if (!valsa)
+	if (!pcmtst)
 		return 0;
-	kfree(valsa);
+	kfree(pcmtst);
 	return 0;
 }
 
 // These callbacks are required, but empty - all freeing occurs in pdev_remove
-static int snd_valsa_dev_free(struct snd_device *device)
+static int snd_pcmtst_dev_free(struct snd_device *device)
 {
 	return 0;
 }
 
-static void valsa_pdev_release(struct device *dev)
+static void pcmtst_pdev_release(struct device *dev)
 {
 }
 
-static int snd_valsa_pcm_prepare(struct snd_pcm_substream *substream)
+static int snd_pcmtst_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	if (inject_prepare_err)
 		return -EINVAL;
 	return 0;
 }
 
-static int snd_valsa_pcm_hw_params(struct snd_pcm_substream *substream,
-				   struct snd_pcm_hw_params *params)
+static int snd_pcmtst_pcm_hw_params(struct snd_pcm_substream *substream,
+				    struct snd_pcm_hw_params *params)
 {
 	if (inject_hwpars_err)
 		return -EBUSY;
 	return 0;
 }
 
-static int snd_valsa_pcm_hw_free(struct snd_pcm_substream *substream)
+static int snd_pcmtst_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	return 0;
 }
 
-static int snd_valsa_ioctl(struct snd_pcm_substream *substream, unsigned int cmd, void *arg)
+static int snd_pcmtst_ioctl(struct snd_pcm_substream *substream, unsigned int cmd, void *arg)
 {
 	switch (cmd) {
 	case SNDRV_PCM_IOCTL1_RESET:
@@ -325,80 +382,80 @@ static int snd_valsa_ioctl(struct snd_pcm_substream *substream, unsigned int cmd
 	return snd_pcm_lib_ioctl(substream, cmd, arg);
 }
 
-static const struct snd_pcm_ops snd_valsa_playback_ops = {
-	.open =		snd_valsa_pcm_open,
-	.close =	snd_valsa_pcm_close,
-	.trigger =	snd_valsa_pcm_trigger,
-	.hw_params =	snd_valsa_pcm_hw_params,
-	.ioctl =	snd_valsa_ioctl,
-	.hw_free =	snd_valsa_pcm_hw_free,
-	.prepare =	snd_valsa_pcm_prepare,
-	.pointer =	snd_valsa_pcm_pointer,
+static const struct snd_pcm_ops snd_pcmtst_playback_ops = {
+	.open =		snd_pcmtst_pcm_open,
+	.close =	snd_pcmtst_pcm_close,
+	.trigger =	snd_pcmtst_pcm_trigger,
+	.hw_params =	snd_pcmtst_pcm_hw_params,
+	.ioctl =	snd_pcmtst_ioctl,
+	.hw_free =	snd_pcmtst_pcm_hw_free,
+	.prepare =	snd_pcmtst_pcm_prepare,
+	.pointer =	snd_pcmtst_pcm_pointer,
 };
 
-static const struct snd_pcm_ops snd_valsa_capture_ops = {
-	.open =		snd_valsa_pcm_open,
-	.close =	snd_valsa_pcm_close,
-	.trigger =	snd_valsa_pcm_trigger,
-	.hw_params =	snd_valsa_pcm_hw_params,
-	.hw_free =	snd_valsa_pcm_hw_free,
-	.ioctl =	snd_valsa_ioctl,
-	.prepare =	snd_valsa_pcm_prepare,
-	.pointer =	snd_valsa_pcm_pointer,
+static const struct snd_pcm_ops snd_pcmtst_capture_ops = {
+	.open =		snd_pcmtst_pcm_open,
+	.close =	snd_pcmtst_pcm_close,
+	.trigger =	snd_pcmtst_pcm_trigger,
+	.hw_params =	snd_pcmtst_pcm_hw_params,
+	.hw_free =	snd_pcmtst_pcm_hw_free,
+	.ioctl =	snd_pcmtst_ioctl,
+	.prepare =	snd_pcmtst_pcm_prepare,
+	.pointer =	snd_pcmtst_pcm_pointer,
 };
 
-static int snd_valsa_new_pcm(struct valsa *valsa)
+static int snd_pcmtst_new_pcm(struct pcmtst *pcmtst)
 {
 	struct snd_pcm *pcm;
 	int err;
 
-	err = snd_pcm_new(valsa->card, "VirtualAlsa", 0, PLAYBACK_SUBSTREAM_CNT,
+	err = snd_pcm_new(pcmtst->card, "PCMTest", 0, PLAYBACK_SUBSTREAM_CNT,
 			  CAPTURE_SUBSTREAM_CNT, &pcm);
 	if (err < 0)
 		return err;
-	pcm->private_data = valsa;
-	strcpy(pcm->name, "VirtualAlsa");
-	valsa->pcm = pcm;
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_valsa_playback_ops);
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_valsa_capture_ops);
+	pcm->private_data = pcmtst;
+	strcpy(pcm->name, "PCMTest");
+	pcmtst->pcm = pcm;
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_pcmtst_playback_ops);
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_pcmtst_capture_ops);
 
-	err = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &valsa->pdev->dev,
-					     64 * 1024, 64 * 1024);
+	err = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, &pcmtst->pdev->dev,
+					     0, 128 * 1024);
 	return err;
 }
 
-static int snd_valsa_create(struct snd_card *card, struct platform_device *pdev,
-			    struct valsa **r_valsa)
+static int snd_pcmtst_create(struct snd_card *card, struct platform_device *pdev,
+			     struct pcmtst **r_pcmtst)
 {
-	struct valsa *valsa;
+	struct pcmtst *pcmtst;
 	int err;
 	static const struct snd_device_ops ops = {
-		.dev_free = snd_valsa_dev_free,
+		.dev_free = snd_pcmtst_dev_free,
 	};
 
-	valsa = kzalloc(sizeof(*valsa), GFP_KERNEL);
-	if (!valsa)
+	pcmtst = kzalloc(sizeof(*pcmtst), GFP_KERNEL);
+	if (!pcmtst)
 		return -ENOMEM;
-	valsa->card = card;
-	valsa->pdev = pdev;
+	pcmtst->card = card;
+	pcmtst->pdev = pdev;
 
-	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, valsa, &ops);
+	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, pcmtst, &ops);
 	if (err < 0)
 		goto _err_free_chip;
 
-	err = snd_valsa_new_pcm(valsa);
+	err = snd_pcmtst_new_pcm(pcmtst);
 	if (err < 0)
 		goto _err_free_chip;
 
-	*r_valsa = valsa;
+	*r_pcmtst = pcmtst;
 	return 0;
 
 _err_free_chip:
-	snd_valsa_free(valsa);
+	snd_pcmtst_free(pcmtst);
 	return err;
 }
 
-static int valsa_probe(struct platform_device *pdev)
+static int pcmtst_probe(struct platform_device *pdev)
 {
 	struct snd_card *card;
 	int err;
@@ -410,13 +467,13 @@ static int valsa_probe(struct platform_device *pdev)
 	err = snd_devm_card_new(&pdev->dev, index, id, THIS_MODULE, 0, &card);
 	if (err < 0)
 		return err;
-	err = snd_valsa_create(card, pdev, &valsa);
+	err = snd_pcmtst_create(card, pdev, &pcmtst);
 	if (err < 0)
 		return err;
 
-	strcpy(card->driver, "VirtualALSA");
-	strcpy(card->shortname, "VirtualALSA");
-	strcpy(card->longname, "Virtual ALSA card");
+	strcpy(card->driver, "PCM-TEST Driver");
+	strcpy(card->shortname, "PCM-Test");
+	strcpy(card->longname, "PCM-Test virtual driver");
 
 	err = snd_card_register(card);
 	if (err < 0)
@@ -427,20 +484,20 @@ static int valsa_probe(struct platform_device *pdev)
 
 static int pdev_remove(struct platform_device *dev)
 {
-	snd_valsa_free(valsa);
+	snd_pcmtst_free(pcmtst);
 	return 0;
 }
 
-static struct platform_device valsa_pdev = {
-	.name =		"valsa",
-	.dev.release =	valsa_pdev_release,
+static struct platform_device pcmtst_pdev = {
+	.name =		"pcmtst",
+	.dev.release =	pcmtst_pdev_release,
 };
 
-static struct platform_driver valsa_pdrv = {
-	.probe =	valsa_probe,
+static struct platform_driver pcmtst_pdrv = {
+	.probe =	pcmtst_probe,
 	.remove =	pdev_remove,
 	.driver =	{
-		.name = "valsa",
+		.name = "pcmtst",
 	},
 };
 
@@ -487,7 +544,7 @@ static const struct file_operations fill_pattern_fops = {
 
 static int init_debug_files(void)
 {
-	driver_debug_dir = debugfs_create_dir("valsa", NULL);
+	driver_debug_dir = debugfs_create_dir("pcmtst", NULL);
 	if (IS_ERR(driver_debug_dir))
 		return PTR_ERR(driver_debug_dir);
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
@@ -509,12 +566,12 @@ static int __init mod_init(void)
 	err = init_debug_files();
 	if (err)
 		return err;
-	err = platform_device_register(&valsa_pdev);
+	err = platform_device_register(&pcmtst_pdev);
 	if (err)
 		return err;
-	err = platform_driver_register(&valsa_pdrv);
+	err = platform_driver_register(&pcmtst_pdrv);
 	if (err)
-		platform_device_unregister(&valsa_pdev);
+		platform_device_unregister(&pcmtst_pdev);
 	return err;
 }
 
@@ -522,8 +579,8 @@ static void __exit mod_exit(void)
 {
 	clear_debug_files();
 
-	platform_driver_unregister(&valsa_pdrv);
-	platform_device_unregister(&valsa_pdev);
+	platform_driver_unregister(&pcmtst_pdrv);
+	platform_device_unregister(&pcmtst_pdev);
 }
 
 MODULE_LICENSE("GPL");
