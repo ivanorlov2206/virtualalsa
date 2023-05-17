@@ -116,7 +116,7 @@ static struct snd_pcm_hardware snd_pcmtst_hw = {
 	.rate_max =		48000,
 	.channels_min =		1,
 	.channels_max =		MAX_CHANNELS_NUM,
-	.buffer_bytes_max =	65536,
+	.buffer_bytes_max =	131072,
 	.period_bytes_min =	4096,
 	.period_bytes_max =	32768,
 	.periods_min =		1,
@@ -215,8 +215,30 @@ static void fill_block_pattern(struct pcmtst_buf_iter *v_iter, struct snd_pcm_ru
 		fill_block_pattern_nint(v_iter, runtime);
 }
 
-// We can be in either interleaved or non-interleaved modes. The data is random, so we don't care
-static void fill_block_random(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+{
+	unsigned int channels = runtime->channels;
+	// Remaining space in all channel buffers
+	size_t bytes_remain = runtime->dma_bytes - v_iter->buf_pos;
+	unsigned int offset;
+	unsigned int i;
+
+	for (i = 0; i < channels; i++) {
+		offset = v_iter->chan_block * i + v_iter->buf_pos / channels;
+		if (v_iter->b_rw <= bytes_remain) {
+			//b_rw - count of bytes must be written for all channels at each timer tick
+			get_random_bytes(runtime->dma_area + offset, v_iter->b_rw / channels);
+		} else {
+			// Write to the end of buffer and start from the beginning of it
+			get_random_bytes(runtime->dma_area + offset, bytes_remain / channels);
+			get_random_bytes(runtime->dma_area + v_iter->chan_block * i,
+					 (v_iter->b_rw - bytes_remain) / channels);
+		}
+	}
+	inc_buf_pos(v_iter, v_iter->b_rw, runtime->dma_bytes);
+}
+
+static void fill_block_rand_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t in_cur_block = runtime->dma_bytes - v_iter->buf_pos;
 
@@ -227,6 +249,14 @@ static void fill_block_random(struct pcmtst_buf_iter *v_iter, struct snd_pcm_run
 		get_random_bytes(runtime->dma_area, v_iter->b_rw - in_cur_block);
 	}
 	inc_buf_pos(v_iter, v_iter->b_rw, runtime->dma_bytes);
+}
+
+static void fill_block_random(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+{
+	if (v_iter->interleaved)
+		fill_block_rand_int(v_iter, runtime);
+	else
+		fill_block_rand_nint(v_iter, runtime);
 }
 
 static void fill_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
