@@ -36,7 +36,7 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 
-#define DEVNAME "pcmtstd"
+#define DEVNAME "pcmtestd"
 #define CARD_NAME "pcm-test-card"
 #define TIMER_PER_SEC 5
 #define TIMER_INTERVAL (HZ / TIMER_PER_SEC)
@@ -51,7 +51,7 @@
 #define MAX_PATTERN_LEN 4096
 
 static int index = -1;
-static char *id = "pcmtst";
+static char *id = "pcmtest";
 static bool enable = true;
 static int inject_delay;
 static bool inject_hwpars_err;
@@ -519,7 +519,7 @@ static int pdev_remove(struct platform_device *dev)
 }
 
 static struct platform_device pcmtst_pdev = {
-	.name =		"pcmtst",
+	.name =		"pcmtest",
 	.dev.release =	pcmtst_pdev_release,
 };
 
@@ -527,7 +527,7 @@ static struct platform_driver pcmtst_pdrv = {
 	.probe =	pcmtst_probe,
 	.remove =	pdev_remove,
 	.driver =	{
-		.name = "pcmtst",
+		.name = "pcmtest",
 	},
 };
 
@@ -574,7 +574,7 @@ static const struct file_operations fill_pattern_fops = {
 
 static int init_debug_files(void)
 {
-	driver_debug_dir = debugfs_create_dir("pcmtst", NULL);
+	driver_debug_dir = debugfs_create_dir("pcmtest", NULL);
 	if (IS_ERR(driver_debug_dir))
 		return PTR_ERR(driver_debug_dir);
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);

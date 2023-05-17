@@ -5,7 +5,7 @@ make the DMA buffer allocation possible, as well as ALSA snd_\* api to
 actually generate some sound. You can probably use this driver as an
 example of virtual ALSA driver for your own purposes, or for some userspace applications testing/fuzzing.
 
-It creates the virtual sound card called "pcmtst". After inserting the module
+It creates the virtual sound card called "pcmtest". After inserting the module
 you will be able to find it in aplay -L list.
 
 ## What can it do?
@@ -19,7 +19,7 @@ It can:
 - Inject delays into the capturing process
 
 ```
-arecord -D hw:CARD=pcmtst,DEV=0 -c 1 -f S16_LE --duration=3 out.wav
+arecord -D hw:CARD=pcmtest,DEV=0 -c 1 -f S16_LE --duration=3 out.wav
 ```
 And you have 3 seconds of beautiful white noise...
 
@@ -34,7 +34,7 @@ echo 1 > /sys/module/pcmtest/parameters/fill_mode
 ```
 The most interesting is the second mode, where you can specify the pattern to repeat:
 ```
-echo some_pattern > /sys/kernel/debug/pcmtst/fill_pattern
+echo some_pattern > /sys/kernel/debug/pcmtest/fill_pattern
 ```
 The pattern can be up to 1024 bytes long.
 
@@ -42,7 +42,7 @@ Also, it can be used for checking the playback functionality.
 If the playback buffer contains the looped pattern (which you set in fill_pattern) the test will
 success, and the
 ```
-/sys/kernel/debug/pcmtst/pc_test
+/sys/kernel/debug/pcmtest/pc_test
 ```
 file will contain '1' after the pcm closing. Otherwise, if the buffer is
 corrupted somehow, this debugfs file will contain '0'.
