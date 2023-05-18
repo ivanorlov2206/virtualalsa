@@ -36,7 +36,7 @@ The most interesting is the second mode, where you can specify the pattern to re
 ```
 echo some_pattern > /sys/kernel/debug/pcmtest/fill_pattern
 ```
-The pattern can be up to 1024 bytes long.
+The pattern can be up to 4096 bytes long.
 
 Also, it can be used for checking the playback functionality.
 If the playback buffer contains the looped pattern (which you set in fill_pattern) the test will
