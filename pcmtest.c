@@ -19,6 +19,11 @@
  *	- Support up to 4 channels
  *	- Support framerates from 8 kHz to 48 kHz
  *
+ * When driver works in the capture mode with multiple channels, it duplicates the looped
+ * pattern to each separate channel. For example, if we have 2 channels, format = U8, interleaved
+ * access mode and pattern 'abacaba', the DMA buffer will look like aabbccaabbaaaa..., so buffer for
+ * each channel will contain abacabaabacaba... Same for the non-interleaved mode.
+ *
  * However, it may break on the higher framerates with small period size, so it is better to choose
  * larger period sizes.
  *
@@ -116,7 +121,7 @@ static struct snd_pcm_hardware snd_pcmtst_hw = {
 	.rate_max =		48000,
 	.channels_min =		1,
 	.channels_max =		MAX_CHANNELS_NUM,
-	.buffer_bytes_max =	131072,
+	.buffer_bytes_max =	128 * 1024,
 	.period_bytes_min =	4096,
 	.period_bytes_max =	32768,
 	.periods_min =		1,
@@ -220,17 +225,17 @@ static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 	unsigned int channels = runtime->channels;
 	// Remaining space in all channel buffers
 	size_t bytes_remain = runtime->dma_bytes - v_iter->buf_pos;
-	unsigned int offset;
 	unsigned int i;
 
 	for (i = 0; i < channels; i++) {
-		offset = v_iter->chan_block * i + v_iter->buf_pos / channels;
 		if (v_iter->b_rw <= bytes_remain) {
 			//b_rw - count of bytes must be written for all channels at each timer tick
-			get_random_bytes(runtime->dma_area + offset, v_iter->b_rw / channels);
+			get_random_bytes(runtime->dma_area + buf_pos_nint(v_iter, channels, i),
+					 v_iter->b_rw / channels);
 		} else {
 			// Write to the end of buffer and start from the beginning of it
-			get_random_bytes(runtime->dma_area + offset, bytes_remain / channels);
+			get_random_bytes(runtime->dma_area + buf_pos_nint(v_iter, channels, i),
+					 bytes_remain / channels);
 			get_random_bytes(runtime->dma_area + v_iter->chan_block * i,
 					 (v_iter->b_rw - bytes_remain) / channels);
 		}
@@ -343,6 +348,7 @@ static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	if (inject_trigger_err)
 		return -EINVAL;
+
 	v_iter->sample_bytes = runtime->sample_bits / 8;
 	v_iter->period_bytes = frames_to_bytes(runtime, runtime->period_size);
 	if (runtime->access == SNDRV_PCM_ACCESS_RW_NONINTERLEAVED ||
@@ -354,6 +360,7 @@ static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	}
 	// We want to record RATE * ch_cnt samples per sec, it is rate * sample_bytes * ch_cnt bytes
 	v_iter->b_rw = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC * runtime->channels;
+
 	return 0;
 }
 
