@@ -24,8 +24,8 @@
  * access mode and pattern 'abacaba', the DMA buffer will look like aabbccaabbaaaa..., so buffer for
  * each channel will contain abacabaabacaba... Same for the non-interleaved mode.
  *
- * However, it may break on the higher framerates with small period size, so it is better to choose
- * larger period sizes.
+ * However, it may break the capturing on the higher framerates with small period size, so it is
+ * better to choose larger period sizes.
  *
  * You can find the corresponding selftest in the 'alsa' selftests folder.
  */
@@ -65,7 +65,7 @@ static bool inject_trigger_err;
 
 static short fill_mode = FILL_MODE_PAT;
 static char fill_pattern[MAX_PATTERN_LEN] = "abacaba";
-static ssize_t pattern_len = 7;
+static u32 pattern_len = 7;
 
 static u8 playback_capture_test;
 static u8 ioctl_reset_test;
@@ -135,12 +135,24 @@ static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t
 	v_iter->buf_pos %= bytes;
 }
 
+// Position in the DMA buffer when we are in the non-interleaved mode (see below)
+static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int channels,
+				  unsigned int chan_num)
+{
+	return v_iter->buf_pos / channels + v_iter->chan_block * chan_num;
+}
+
 /*
- * Check one block of the buffer. Here we iterate the buffer until we find '0'. This condition is
- * necessary because we need to detect when the reading/writing ends, so we assume that the pattern
- * doesn't contain zeros.
+ * Get the count of bytes written for the current channel in the interleaved mode.
+ * This is (count of samples written for the current channel) * bytes_in_sample +
+ * (relative position in the current sample)
  */
-static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static inline size_t ch_pos_int(size_t b_total, unsigned int channels, unsigned int b_sample)
+{
+	return b_total / channels / b_sample * b_sample + b_total % b_sample;
+}
+
+static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	u8 current_byte;
@@ -149,7 +161,30 @@ static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runti
 		current_byte = runtime->dma_area[v_iter->buf_pos];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[v_iter->total_bytes % pattern_len]) {
+		if (current_byte != fill_pattern[ch_pos_int(v_iter->total_bytes, runtime->channels,
+						 v_iter->sample_bytes) % pattern_len]) {
+			v_iter->is_buf_corrupted = true;
+			break;
+		}
+		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
+	}
+	// If we broke during the loop, add remaining bytes to the buffer position.
+	inc_buf_pos(v_iter, v_iter->b_rw - i, runtime->dma_bytes);
+
+}
+
+static void check_buf_block_ni(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+{
+	unsigned int channels = runtime->channels;
+	size_t i;
+	u8 current_byte;
+
+	for (i = 0; i < v_iter->b_rw; i++) {
+		current_byte = runtime->dma_area[buf_pos_nint(v_iter, channels, i % channels)];
+		if (!current_byte)
+			break;
+		if (current_byte != fill_pattern[(v_iter->total_bytes / channels)
+						 % pattern_len]) {
 			v_iter->is_buf_corrupted = true;
 			break;
 		}
@@ -158,11 +193,17 @@ static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runti
 	inc_buf_pos(v_iter, v_iter->b_rw - i, runtime->dma_bytes);
 }
 
-// Position in the DMA buffer when we are in the non-interleaved mode (see below)
-static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int channels,
-				  unsigned int chan_num)
+/*
+ * Check one block of the buffer. Here we iterate the buffer until we find '0'. This condition is
+ * necessary because we need to detect when the reading/writing ends, so we assume that the pattern
+ * doesn't contain zeros.
+ */
+static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
-	return v_iter->buf_pos / channels + v_iter->chan_block * chan_num;
+	if (v_iter->interleaved)
+		check_buf_block_i(v_iter, runtime);
+	else
+		check_buf_block_ni(v_iter, runtime);
 }
 
 /*
@@ -175,26 +216,14 @@ static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int c
  */
 static void fill_block_pattern_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
-	size_t i, j;
+	size_t i;
 	unsigned int channels = runtime->channels;
 
-	for (i = 0; i < v_iter->b_rw / channels; i++) {
-		for (j = 0; j < channels; j++) {
-			runtime->dma_area[buf_pos_nint(v_iter, channels, j)] =
-				fill_pattern[(v_iter->total_bytes / channels) % pattern_len];
-			inc_buf_pos(v_iter, 1, runtime->dma_bytes);
-		}
+	for (i = 0; i < v_iter->b_rw; i++) {
+		runtime->dma_area[buf_pos_nint(v_iter, channels, i % channels)] =
+			fill_pattern[(v_iter->total_bytes / channels) % pattern_len];
+		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
-}
-
-/*
- * Get the count of bytes written for the current channel in the interleaved mode.
- * This is (count of samples written for the current channel) * bytes_in_sample +
- * (relative position in the current sample)
- */
-static inline size_t ch_pos_int(size_t b_total, unsigned int channels, unsigned int b_sample)
-{
-	return b_total / channels / b_sample * b_sample + b_total % b_sample;
 }
 
 // Fill buffer in the interleaved mode. The order of samples is C0, C1, C2, C0, C1, C2, ...
@@ -585,6 +614,7 @@ static int init_debug_files(void)
 	if (IS_ERR(driver_debug_dir))
 		return PTR_ERR(driver_debug_dir);
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
+	debugfs_create_u32("pattern_len", 0444, driver_debug_dir, &pattern_len);
 	debugfs_create_u8("ioctl_test", 0444, driver_debug_dir, &ioctl_reset_test);
 	debugfs_create_file("fill_pattern", 0600, driver_debug_dir, NULL, &fill_pattern_fops);
 
