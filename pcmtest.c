@@ -135,9 +135,13 @@ static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t
 	v_iter->buf_pos %= bytes;
 }
 
-// Position in the DMA buffer when we are in the non-interleaved mode (see below)
-static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int channels,
-				  unsigned int chan_num)
+/*
+ * Position in the DMA buffer when we are in the non-interleaved mode. We increment buf_pos
+ * every time we write a byte to any channel, so the position in the current channel buffer is
+ * (position in the DMA buffer) / count_of_channels + size_of_channel_buf * current_channel
+ */
+static inline size_t buf_pos_n(struct pcmtst_buf_iter *v_iter, unsigned int channels,
+			       unsigned int chan_num)
 {
 	return v_iter->buf_pos / channels + v_iter->chan_block * chan_num;
 }
@@ -147,7 +151,7 @@ static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int c
  * This is (count of samples written for the current channel) * bytes_in_sample +
  * (relative position in the current sample)
  */
-static inline size_t ch_pos_int(size_t b_total, unsigned int channels, unsigned int b_sample)
+static inline size_t ch_pos_i(size_t b_total, unsigned int channels, unsigned int b_sample)
 {
 	return b_total / channels / b_sample * b_sample + b_total % b_sample;
 }
@@ -161,8 +165,8 @@ static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_run
 		current_byte = runtime->dma_area[v_iter->buf_pos];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[ch_pos_int(v_iter->total_bytes, runtime->channels,
-						 v_iter->sample_bytes) % pattern_len]) {
+		if (current_byte != fill_pattern[ch_pos_i(v_iter->total_bytes, runtime->channels,
+							  v_iter->sample_bytes) % pattern_len]) {
 			v_iter->is_buf_corrupted = true;
 			break;
 		}
@@ -170,7 +174,6 @@ static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_run
 	}
 	// If we broke during the loop, add remaining bytes to the buffer position.
 	inc_buf_pos(v_iter, v_iter->b_rw - i, runtime->dma_bytes);
-
 }
 
 static void check_buf_block_ni(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
@@ -180,7 +183,7 @@ static void check_buf_block_ni(struct pcmtst_buf_iter *v_iter, struct snd_pcm_ru
 	u8 current_byte;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
-		current_byte = runtime->dma_area[buf_pos_nint(v_iter, channels, i % channels)];
+		current_byte = runtime->dma_area[buf_pos_n(v_iter, channels, i % channels)];
 		if (!current_byte)
 			break;
 		if (current_byte != fill_pattern[(v_iter->total_bytes / channels)
@@ -214,27 +217,27 @@ static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runti
  * Here we increment the DMA buffer position every time we write a byte to any channel 'buffer'.
  * We need this to simulate the correct hardware pointer moving.
  */
-static void fill_block_pattern_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_pattern_n(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	unsigned int channels = runtime->channels;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
-		runtime->dma_area[buf_pos_nint(v_iter, channels, i % channels)] =
+		runtime->dma_area[buf_pos_n(v_iter, channels, i % channels)] =
 			fill_pattern[(v_iter->total_bytes / channels) % pattern_len];
 		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
 }
 
 // Fill buffer in the interleaved mode. The order of samples is C0, C1, C2, C0, C1, C2, ...
-static void fill_block_pattern_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_pattern_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	size_t pos_in_ch;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
-		pos_in_ch = ch_pos_int(v_iter->total_bytes, runtime->channels,
-				       v_iter->sample_bytes);
+		pos_in_ch = ch_pos_i(v_iter->total_bytes, runtime->channels,
+				     v_iter->sample_bytes);
 
 		runtime->dma_area[v_iter->buf_pos] = fill_pattern[pos_in_ch % pattern_len];
 		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
@@ -244,12 +247,12 @@ static void fill_block_pattern_int(struct pcmtst_buf_iter *v_iter, struct snd_pc
 static void fill_block_pattern(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	if (v_iter->interleaved)
-		fill_block_pattern_int(v_iter, runtime);
+		fill_block_pattern_i(v_iter, runtime);
 	else
-		fill_block_pattern_nint(v_iter, runtime);
+		fill_block_pattern_n(v_iter, runtime);
 }
 
-static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_rand_n(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	unsigned int channels = runtime->channels;
 	// Remaining space in all channel buffers
@@ -259,11 +262,11 @@ static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 	for (i = 0; i < channels; i++) {
 		if (v_iter->b_rw <= bytes_remain) {
 			//b_rw - count of bytes must be written for all channels at each timer tick
-			get_random_bytes(runtime->dma_area + buf_pos_nint(v_iter, channels, i),
+			get_random_bytes(runtime->dma_area + buf_pos_n(v_iter, channels, i),
 					 v_iter->b_rw / channels);
 		} else {
 			// Write to the end of buffer and start from the beginning of it
-			get_random_bytes(runtime->dma_area + buf_pos_nint(v_iter, channels, i),
+			get_random_bytes(runtime->dma_area + buf_pos_n(v_iter, channels, i),
 					 bytes_remain / channels);
 			get_random_bytes(runtime->dma_area + v_iter->chan_block * i,
 					 (v_iter->b_rw - bytes_remain) / channels);
@@ -272,7 +275,7 @@ static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 	inc_buf_pos(v_iter, v_iter->b_rw, runtime->dma_bytes);
 }
 
-static void fill_block_rand_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_rand_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t in_cur_block = runtime->dma_bytes - v_iter->buf_pos;
 
@@ -288,9 +291,9 @@ static void fill_block_rand_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_r
 static void fill_block_random(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	if (v_iter->interleaved)
-		fill_block_rand_int(v_iter, runtime);
+		fill_block_rand_i(v_iter, runtime);
 	else
-		fill_block_rand_nint(v_iter, runtime);
+		fill_block_rand_n(v_iter, runtime);
 }
 
 static void fill_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
