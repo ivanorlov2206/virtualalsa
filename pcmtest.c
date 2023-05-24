@@ -50,6 +50,9 @@
 #define CAPTURE_SUBSTREAM_CNT	8
 #define MAX_CHANNELS_NUM	4
 
+#define DEFAULT_PATTERN		"abacaba"
+#define DEFAULT_PATTERN_LEN	7
+
 #define FILL_MODE_RAND	0
 #define FILL_MODE_PAT	1
 
@@ -64,8 +67,6 @@ static bool inject_prepare_err;
 static bool inject_trigger_err;
 
 static short fill_mode = FILL_MODE_PAT;
-static char fill_pattern[MAX_PATTERN_LEN] = "abacaba";
-static u32 pattern_len = 7;
 
 static u8 playback_capture_test;
 static u8 ioctl_reset_test;
@@ -128,6 +129,13 @@ static struct snd_pcm_hardware snd_pcmtst_hw = {
 	.periods_max =		1024,
 };
 
+struct pattern_buf {
+	char buf[MAX_PATTERN_LEN];
+	size_t len;
+};
+
+static struct pattern_buf patt_bufs[MAX_CHANNELS_NUM];
+
 static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t bytes)
 {
 	v_iter->total_bytes += by;
@@ -159,14 +167,18 @@ static inline size_t ch_pos_i(size_t b_total, unsigned int channels, unsigned in
 static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
+	short ch_num;
 	u8 current_byte;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
 		current_byte = runtime->dma_area[v_iter->buf_pos];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[ch_pos_i(v_iter->total_bytes, runtime->channels,
-							  v_iter->sample_bytes) % pattern_len]) {
+		ch_num = (v_iter->total_bytes / v_iter->sample_bytes) % runtime->channels;
+		if (current_byte != patt_bufs[ch_num].buf[ch_pos_i(v_iter->total_bytes,
+								   runtime->channels,
+								   v_iter->sample_bytes)
+							  % patt_bufs[ch_num].len]) {
 			v_iter->is_buf_corrupted = true;
 			break;
 		}
@@ -180,14 +192,16 @@ static void check_buf_block_ni(struct pcmtst_buf_iter *v_iter, struct snd_pcm_ru
 {
 	unsigned int channels = runtime->channels;
 	size_t i;
+	short ch_num;
 	u8 current_byte;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
 		current_byte = runtime->dma_area[buf_pos_n(v_iter, channels, i % channels)];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[(v_iter->total_bytes / channels)
-						 % pattern_len]) {
+		ch_num = i % channels;
+		if (current_byte != patt_bufs[ch_num].buf[(v_iter->total_bytes / channels)
+							  % patt_bufs[ch_num].len]) {
 			v_iter->is_buf_corrupted = true;
 			break;
 		}
@@ -221,10 +235,13 @@ static void fill_block_pattern_n(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 {
 	size_t i;
 	unsigned int channels = runtime->channels;
+	short ch_num;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
+		ch_num = i % channels;
 		runtime->dma_area[buf_pos_n(v_iter, channels, i % channels)] =
-			fill_pattern[(v_iter->total_bytes / channels) % pattern_len];
+			patt_bufs[ch_num].buf[(v_iter->total_bytes / channels)
+					      % patt_bufs[ch_num].len];
 		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
 }
@@ -234,12 +251,14 @@ static void fill_block_pattern_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 {
 	size_t i;
 	size_t pos_in_ch;
+	short ch_num;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
 		pos_in_ch = ch_pos_i(v_iter->total_bytes, runtime->channels,
 				     v_iter->sample_bytes);
-
-		runtime->dma_area[v_iter->buf_pos] = fill_pattern[pos_in_ch % pattern_len];
+		ch_num = (v_iter->total_bytes / v_iter->sample_bytes) % runtime->channels;
+		runtime->dma_area[v_iter->buf_pos] = patt_bufs[ch_num].buf[pos_in_ch %
+									   patt_bufs[ch_num].len];
 		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
 }
@@ -570,8 +589,9 @@ static struct platform_driver pcmtst_pdrv = {
 	},
 };
 
-static ssize_t pattern_write(struct file *file, const char __user *buff, size_t len, loff_t *off)
+static ssize_t pattern_write(struct file *file, const char __user *u_buff, size_t len, loff_t *off)
 {
+	struct pattern_buf *patt_buf = file->f_inode->i_private;
 	ssize_t to_write = len;
 
 	if (*off + to_write > MAX_PATTERN_LEN)
@@ -581,16 +601,18 @@ static ssize_t pattern_write(struct file *file, const char __user *buff, size_t 
 	if (to_write <= 0)
 		return len;
 
-	if (copy_from_user(fill_pattern + *off, buff, to_write))
+	if (copy_from_user(patt_buf->buf + *off, u_buff, to_write))
 		return -EFAULT;
-	pattern_len = *off + to_write;
+
+	patt_buf->len = *off + to_write;
 	*off += to_write;
 
 	return to_write;
 }
 
-static ssize_t pattern_read(struct file *file, char __user *buff, size_t len, loff_t *off)
+static ssize_t pattern_read(struct file *file, char __user *u_buff, size_t len, loff_t *off)
 {
+	struct pattern_buf *patt_buf = file->f_inode->i_private;
 	ssize_t to_read = len;
 
 	if (*off + to_read >= MAX_PATTERN_LEN)
@@ -598,7 +620,7 @@ static ssize_t pattern_read(struct file *file, char __user *buff, size_t len, lo
 	if (to_read <= 0)
 		return 0;
 
-	if (copy_to_user(buff, fill_pattern + *off, to_read))
+	if (copy_to_user(u_buff, patt_buf->buf + *off, to_read))
 		to_read = 0;
 	else
 		*off += to_read;
@@ -611,15 +633,31 @@ static const struct file_operations fill_pattern_fops = {
 	.write = pattern_write,
 };
 
+static void setup_patt_bufs(void)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(patt_bufs); i++) {
+		strcpy(patt_bufs[i].buf, DEFAULT_PATTERN);
+		patt_bufs[i].len = DEFAULT_PATTERN_LEN;
+	}
+}
+
+static const char * const pattern_files[] = { "fill_pattern0", "fill_pattern1",
+					      "fill_pattern2", "fill_pattern3"};
 static int init_debug_files(void)
 {
+	size_t i;
+
 	driver_debug_dir = debugfs_create_dir("pcmtest", NULL);
 	if (IS_ERR(driver_debug_dir))
 		return PTR_ERR(driver_debug_dir);
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
-	debugfs_create_u32("pattern_len", 0444, driver_debug_dir, &pattern_len);
 	debugfs_create_u8("ioctl_test", 0444, driver_debug_dir, &ioctl_reset_test);
-	debugfs_create_file("fill_pattern", 0600, driver_debug_dir, NULL, &fill_pattern_fops);
+
+	for (i = 0; i < ARRAY_SIZE(pattern_files); i++)
+		debugfs_create_file(pattern_files[i], 0600, driver_debug_dir,
+				    &patt_bufs[i], &fill_pattern_fops);
 
 	return 0;
 }
@@ -633,6 +671,7 @@ static int __init mod_init(void)
 {
 	int err = 0;
 
+	setup_patt_bufs();
 	err = init_debug_files();
 	if (err)
 		return err;
