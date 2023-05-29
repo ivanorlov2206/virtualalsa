@@ -131,7 +131,7 @@ static struct snd_pcm_hardware snd_pcmtst_hw = {
 
 struct pattern_buf {
 	char buf[MAX_PATTERN_LEN];
-	size_t len;
+	u32 len;
 };
 
 static struct pattern_buf patt_bufs[MAX_CHANNELS_NUM];
@@ -648,6 +648,7 @@ static const char * const pattern_files[] = { "fill_pattern0", "fill_pattern1",
 static int init_debug_files(void)
 {
 	size_t i;
+	char len_file_name[32];
 
 	driver_debug_dir = debugfs_create_dir("pcmtest", NULL);
 	if (IS_ERR(driver_debug_dir))
@@ -655,9 +656,12 @@ static int init_debug_files(void)
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
 	debugfs_create_u8("ioctl_test", 0444, driver_debug_dir, &ioctl_reset_test);
 
-	for (i = 0; i < ARRAY_SIZE(pattern_files); i++)
+	for (i = 0; i < ARRAY_SIZE(pattern_files); i++) {
 		debugfs_create_file(pattern_files[i], 0600, driver_debug_dir,
 				    &patt_bufs[i], &fill_pattern_fops);
+		snprintf(len_file_name, sizeof(len_file_name), "%s_len", pattern_files[i]);
+		debugfs_create_u32(len_file_name, 0444, driver_debug_dir, &patt_bufs[i].len);
+	}
 
 	return 0;
 }
