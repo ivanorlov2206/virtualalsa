@@ -65,6 +65,7 @@ static int inject_delay;
 static bool inject_hwpars_err;
 static bool inject_prepare_err;
 static bool inject_trigger_err;
+static bool inject_random_pointer;
 
 static short fill_mode = FILL_MODE_PAT;
 
@@ -88,6 +89,8 @@ module_param(inject_prepare_err, bool, 0600);
 MODULE_PARM_DESC(inject_prepare_err, "Inject EINVAL error in the 'prepare' callback");
 module_param(inject_trigger_err, bool, 0600);
 MODULE_PARM_DESC(inject_trigger_err, "Inject EINVAL error in the 'trigger' callback");
+module_param(inject_random_pointer, bool, 0600);
+MODULE_PARM_DESC(inject_random_pointer, "Inject random hardware pointer");
 
 struct pcmtst {
 	struct snd_pcm *pcm;
@@ -418,6 +421,12 @@ static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static snd_pcm_uframes_t snd_pcmtst_pcm_pointer(struct snd_pcm_substream *substream)
 {
 	struct pcmtst_buf_iter *v_iter = substream->runtime->private_data;
+	u32 rp;
+
+	if (inject_random_pointer) {
+		get_random_bytes(&rp, sizeof(rp));
+		return rp % substream->runtime->buffer_size;
+	}
 
 	return bytes_to_frames(substream->runtime, v_iter->buf_pos);
 }
