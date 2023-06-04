@@ -21,7 +21,7 @@ It supports up to 8 substreams and 4 channels. Also it supports both interleaved
 non-interleaved access modes.
 
 Also, this driver can check the playback stream for containing the predefined pattern,
-which is used in the corresponding selftest (alsa/pcmtest-test.sh). To check the PCM middle
+which is used in the corresponding selftest (alsa/pcmtest-test.sh) to check the PCM middle
 layer data transferring functionality. Additionally, this driver redefines the default
 RESET ioctl, and the selftest covers this PCM API functionality as well.
 
@@ -46,7 +46,7 @@ data generation. Let's look at the second mode.
 
 First of all, you may want to specify the pattern for data generation. You can do it
 by writing the pattern to the debugfs file (/sys/kernel/debug/pcmtest/fill_pattern).
-Like that:
+For example::
 
 .. code-block:: bash
 
