@@ -65,7 +65,6 @@ static int inject_delay;
 static bool inject_hwpars_err;
 static bool inject_prepare_err;
 static bool inject_trigger_err;
-static bool inject_random_pointer;
 
 static short fill_mode = FILL_MODE_PAT;
 
@@ -89,8 +88,6 @@ module_param(inject_prepare_err, bool, 0600);
 MODULE_PARM_DESC(inject_prepare_err, "Inject EINVAL error in the 'prepare' callback");
 module_param(inject_trigger_err, bool, 0600);
 MODULE_PARM_DESC(inject_trigger_err, "Inject EINVAL error in the 'trigger' callback");
-module_param(inject_random_pointer, bool, 0600);
-MODULE_PARM_DESC(inject_random_pointer, "Inject random hardware pointer");
 
 struct pcmtst {
 	struct snd_pcm *pcm;
@@ -102,6 +99,7 @@ struct pcmtst_buf_iter {
 	size_t buf_pos;				// position in the DMA buffer
 	size_t period_pos;			// period-relative position
 	size_t b_rw;				// Bytes to write on every timer tick
+	size_t s_rw_ch;				// Samples to write to one channel on every tick
 	unsigned int sample_bytes;		// sample_bits / 8
 	bool is_buf_corrupted;			// playback test result indicator
 	size_t period_bytes;			// bytes in a one period
@@ -133,10 +131,11 @@ static struct snd_pcm_hardware snd_pcmtst_hw = {
 };
 
 struct pattern_buf {
-	char buf[MAX_PATTERN_LEN];
+	char *buf;
 	u32 len;
 };
 
+static int buf_allocated;
 static struct pattern_buf patt_bufs[MAX_CHANNELS_NUM];
 
 static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t bytes)
@@ -164,7 +163,7 @@ static inline size_t buf_pos_n(struct pcmtst_buf_iter *v_iter, unsigned int chan
  */
 static inline size_t ch_pos_i(size_t b_total, unsigned int channels, unsigned int b_sample)
 {
-	return b_total / channels / b_sample * b_sample + b_total % b_sample;
+	return b_total / channels / b_sample * b_sample + (b_total % b_sample);
 }
 
 static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
@@ -252,17 +251,21 @@ static void fill_block_pattern_n(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 // Fill buffer in the interleaved mode. The order of samples is C0, C1, C2, C0, C1, C2, ...
 static void fill_block_pattern_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
-	size_t i;
-	size_t pos_in_ch;
-	short ch_num;
+	size_t sample;
+	size_t pos_in_ch, pos_pattern;
+	short ch, pos_sample;
 
-	for (i = 0; i < v_iter->b_rw; i++) {
-		pos_in_ch = ch_pos_i(v_iter->total_bytes, runtime->channels,
-				     v_iter->sample_bytes);
-		ch_num = (v_iter->total_bytes / v_iter->sample_bytes) % runtime->channels;
-		runtime->dma_area[v_iter->buf_pos] = patt_bufs[ch_num].buf[pos_in_ch %
-									   patt_bufs[ch_num].len];
-		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
+	pos_in_ch = ch_pos_i(v_iter->total_bytes, runtime->channels, v_iter->sample_bytes);
+
+	for (sample = 0; sample < v_iter->s_rw_ch; sample++) {
+		for (ch = 0; ch < runtime->channels; ch++) {
+			for (pos_sample = 0; pos_sample < v_iter->sample_bytes; pos_sample++) {
+				pos_pattern = (pos_in_ch + sample * v_iter->sample_bytes
+					      + pos_sample) % patt_bufs[ch].len;
+				runtime->dma_area[v_iter->buf_pos] = patt_bufs[ch].buf[pos_pattern];
+				inc_buf_pos(v_iter, 1, runtime->dma_bytes);
+			}
+		}
 	}
 }
 
@@ -355,7 +358,6 @@ static void timer_timeout(struct timer_list *data)
 		v_iter->period_pos %= v_iter->period_bytes;
 		snd_pcm_period_elapsed(substream);
 	}
-
 	mod_timer(&v_iter->timer_instance, jiffies + TIMER_INTERVAL + inject_delay);
 }
 
@@ -413,7 +415,8 @@ static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		v_iter->interleaved = true;
 	}
 	// We want to record RATE * ch_cnt samples per sec, it is rate * sample_bytes * ch_cnt bytes
-	v_iter->b_rw = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC * runtime->channels;
+	v_iter->s_rw_ch = runtime->rate / TIMER_PER_SEC;
+	v_iter->b_rw = v_iter->s_rw_ch * v_iter->sample_bytes * runtime->channels;
 
 	return 0;
 }
@@ -421,12 +424,6 @@ static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static snd_pcm_uframes_t snd_pcmtst_pcm_pointer(struct snd_pcm_substream *substream)
 {
 	struct pcmtst_buf_iter *v_iter = substream->runtime->private_data;
-	u32 rp;
-
-	if (inject_random_pointer) {
-		get_random_bytes(&rp, sizeof(rp));
-		return rp % substream->runtime->buffer_size;
-	}
 
 	return bytes_to_frames(substream->runtime, v_iter->buf_pos);
 }
@@ -642,19 +639,24 @@ static const struct file_operations fill_pattern_fops = {
 	.write = pattern_write,
 };
 
-static void setup_patt_bufs(void)
+static int setup_patt_bufs(void)
 {
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(patt_bufs); i++) {
+		patt_bufs[i].buf = kzalloc(MAX_PATTERN_LEN, GFP_KERNEL);
+		if (!patt_bufs[i].buf)
+			break;
 		strcpy(patt_bufs[i].buf, DEFAULT_PATTERN);
 		patt_bufs[i].len = DEFAULT_PATTERN_LEN;
 	}
+
+	return i;
 }
 
 static const char * const pattern_files[] = { "fill_pattern0", "fill_pattern1",
 					      "fill_pattern2", "fill_pattern3"};
-static int init_debug_files(void)
+static int init_debug_files(int buf_count)
 {
 	size_t i;
 	char len_file_name[32];
@@ -665,7 +667,7 @@ static int init_debug_files(void)
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
 	debugfs_create_u8("ioctl_test", 0444, driver_debug_dir, &ioctl_reset_test);
 
-	for (i = 0; i < ARRAY_SIZE(pattern_files); i++) {
+	for (i = 0; i < buf_count; i++) {
 		debugfs_create_file(pattern_files[i], 0600, driver_debug_dir,
 				    &patt_bufs[i], &fill_pattern_fops);
 		snprintf(len_file_name, sizeof(len_file_name), "%s_len", pattern_files[i]);
@@ -673,6 +675,14 @@ static int init_debug_files(void)
 	}
 
 	return 0;
+}
+
+static void free_pattern_buffers(void)
+{
+	int i;
+
+	for (i = 0; i < buf_allocated; i++)
+		kfree(patt_bufs[i].buf);
 }
 
 static void clear_debug_files(void)
@@ -684,8 +694,13 @@ static int __init mod_init(void)
 {
 	int err = 0;
 
-	setup_patt_bufs();
-	err = init_debug_files();
+	buf_allocated = setup_patt_bufs();
+	if (!buf_allocated)
+		return -ENOMEM;
+
+	snd_pcmtst_hw.channels_max = buf_allocated;
+
+	err = init_debug_files(buf_allocated);
 	if (err)
 		return err;
 	err = platform_device_register(&pcmtst_pdev);
@@ -700,6 +715,7 @@ static int __init mod_init(void)
 static void __exit mod_exit(void)
 {
 	clear_debug_files();
+	free_pattern_buffers();
 
 	platform_driver_unregister(&pcmtst_pdrv);
 	platform_device_unregister(&pcmtst_pdev);
