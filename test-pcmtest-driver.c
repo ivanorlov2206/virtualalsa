@@ -9,10 +9,14 @@
 #include <alsa/asoundlib.h>
 #include "../kselftest_harness.h"
 
-#define NI_CH 4
+#define CH_NUM 4
 
-static char pattern_buf[4096];
-static unsigned int pattern_len;
+struct pattern_buf {
+	char buf[1024];
+	int len;
+};
+
+struct pattern_buf patterns[CH_NUM];
 
 struct pcmtest_test_params {
 	unsigned long buffer_size;
@@ -20,22 +24,38 @@ struct pcmtest_test_params {
 	unsigned long channels;
 	unsigned int rate;
 	snd_pcm_access_t access;
-	size_t sample_len;
+	size_t sec_buf_len;
+	size_t sample_size;
 	int time;
 	snd_pcm_format_t format;
 };
 
-static void read_pattern()
+static int read_patterns(void)
 {
 	FILE *fp, *fpl;
+	int i;
+	char pf[64];
+	char plf[64];
 
-	fpl = fopen("/sys/kernel/debug/pcmtest/pattern_len", "r");
-	fscanf(fpl, "%u", &pattern_len);
-	fclose(fpl);
+	for (i = 0; i < CH_NUM; i++) {
+		sprintf(plf, "/sys/kernel/debug/pcmtest/fill_pattern%d_len", i);
+		fpl = fopen(plf, "r");
+		if (!fpl)
+			return -1;
+		fscanf(fpl, "%u", &patterns[i].len);
+		fclose(fpl);
 
-	fp = fopen("/sys/kernel/debug/pcmtest/fill_pattern", "r");
-	fread(pattern_buf, 1, pattern_len, fp);
-	fclose(fp);
+		sprintf(pf, "/sys/kernel/debug/pcmtest/fill_pattern%d", i);
+		fp = fopen(pf, "r");
+		if (!fp) {
+			fclose(fpl);
+			return -1;
+		}
+		fread(patterns[i].buf, 1, patterns[i].len, fp);
+		fclose(fp);
+	}
+
+	return 0;
 }
 
 static int get_test_results(char *debug_name)
@@ -57,13 +77,14 @@ static int get_test_results(char *debug_name)
 	return result;
 }
 
-size_t get_sample_len(unsigned int rate, unsigned long channels, snd_pcm_format_t format)
+static size_t get_sec_buf_len(unsigned int rate, unsigned long channels, snd_pcm_format_t format)
 {
 	return rate * channels * snd_pcm_format_physical_width(format) / 8;
 }
 
-int setup_handle(snd_pcm_t **handle, snd_pcm_sw_params_t *swparams, snd_pcm_hw_params_t *hwparams,
-		 struct pcmtest_test_params *params, int card, snd_pcm_stream_t stream)
+static int setup_handle(snd_pcm_t **handle, snd_pcm_sw_params_t *swparams,
+			snd_pcm_hw_params_t *hwparams, struct pcmtest_test_params *params,
+			int card, snd_pcm_stream_t stream)
 {
 	char pcm_name[32];
 	int err;
@@ -97,37 +118,37 @@ FIXTURE(pcmtest) {
 	int card;
 	snd_pcm_sw_params_t *swparams;
 	snd_pcm_hw_params_t *hwparams;
-	unsigned short *samples;
 	struct pcmtest_test_params params;
 };
 
 FIXTURE_TEARDOWN(pcmtest) {
-	free(self->samples);
 }
 
 FIXTURE_SETUP(pcmtest) {
 	char *card_name;
+	int err;
 
 	if (geteuid())
-		SKIP(exit(0), "This test needs root to run!");
+		SKIP(exit(-1), "This test needs root to run!");
 
-	read_pattern();
+	err = read_patterns();
+	if (err)
+		SKIP(exit(-1), "Can't read patterns. Probably, module isn't loaded");
 
 	card_name = malloc(127);
 	ASSERT_NE(card_name, NULL);
 	self->params.buffer_size = 16384;
 	self->params.period_size = 4096;
-	self->params.channels = 1;
+	self->params.channels = CH_NUM;
 	self->params.rate = 8000;
 	self->params.access = SND_PCM_ACCESS_RW_INTERLEAVED;
 	self->params.format = SND_PCM_FORMAT_S16_LE;
 	self->card = -1;
+	self->params.sample_size = snd_pcm_format_physical_width(self->params.format) / 8;
 
-	self->params.sample_len = get_sample_len(self->params.rate, self->params.channels,
-						 self->params.format);
+	self->params.sec_buf_len = get_sec_buf_len(self->params.rate, self->params.channels,
+						   self->params.format);
 	self->params.time = 4;
-	self->samples = malloc(self->params.sample_len * self->params.time);
-	ASSERT_NE(self->samples, NULL);
 
 	while (snd_card_next(&self->card) >= 0) {
 		if (self->card == -1)
@@ -149,70 +170,81 @@ TEST_F(pcmtest, playback) {
 	unsigned char *it;
 	size_t write_res;
 	int test_results;
-	int i;
-	unsigned short *rsamples;
+	int i, cur_ch, pos_in_ch;
+	void *samples;
 	struct pcmtest_test_params *params = &self->params;
+
+	samples = calloc(self->params.sec_buf_len * self->params.time, 1);
+	ASSERT_NE(samples, NULL);
 
 	snd_pcm_sw_params_alloca(&self->swparams);
 	snd_pcm_hw_params_alloca(&self->hwparams);
 
 	ASSERT_EQ(setup_handle(&handle, self->swparams, self->hwparams, params,
 			       self->card, SND_PCM_STREAM_PLAYBACK), 0);
-	snd_pcm_format_set_silence(params->format, self->samples,
+	snd_pcm_format_set_silence(params->format, samples,
 				   params->rate * params->channels * params->time);
-	it = (unsigned char *)self->samples;
-	for (i = 0; i < self->params.sample_len * params->time; i++)
-		it[i] = pattern_buf[i % pattern_len];
-	rsamples = self->samples;
-	for (i = 0; i < params->time; i++) {
-		write_res = snd_pcm_writei(handle, rsamples, params->rate);
-		rsamples += params->rate;
-		ASSERT_GE(write_res, 0);
+	it = samples;
+	for (i = 0; i < self->params.sec_buf_len * params->time; i++) {
+		cur_ch = (i / params->sample_size) % CH_NUM;
+		pos_in_ch = i / params->sample_size / CH_NUM * params->sample_size
+			    + (i % params->sample_size);
+		it[i] = patterns[cur_ch].buf[pos_in_ch % patterns[cur_ch].len];
 	}
+	write_res = snd_pcm_writei(handle, samples, params->rate * params->time);
+	ASSERT_GE(write_res, 0);
 
 	snd_pcm_close(handle);
+	free(samples);
 	test_results = get_test_results("pc_test");
 	ASSERT_EQ(test_results, 1);
 }
 
 /*
  * Here we test that the virtual alsa driver returns looped and monotonically increasing sequence
- * of bytes
+ * of bytes. In the interleaved mode the buffer will contain samples in the following order:
+ * C0, C1, C2, C3, C0, C1, ...
  */
 TEST_F(pcmtest, capture) {
 	snd_pcm_t *handle;
 	unsigned char *it;
 	size_t read_res;
-	int i;
-	unsigned short *rsamples;
+	int i, cur_ch, pos_in_ch;
+	void *samples;
 	struct pcmtest_test_params *params = &self->params;
+
+	samples = calloc(self->params.sec_buf_len * self->params.time, 1);
+	ASSERT_NE(samples, NULL);
 
 	snd_pcm_sw_params_alloca(&self->swparams);
 	snd_pcm_hw_params_alloca(&self->hwparams);
 
 	ASSERT_EQ(setup_handle(&handle, self->swparams, self->hwparams,
 			       params, self->card, SND_PCM_STREAM_CAPTURE), 0);
-	snd_pcm_format_set_silence(params->format, self->samples,
+	snd_pcm_format_set_silence(params->format, samples,
 				   params->rate * params->channels * params->time);
-	rsamples = self->samples;
-	for (i = 0; i < params->time; i++) {
-		read_res = snd_pcm_readi(handle, rsamples, params->rate);
-		rsamples += params->rate;
-		ASSERT_GE(read_res, 0);
-	}
+	read_res = snd_pcm_readi(handle, samples, params->rate * params->time);
+	ASSERT_GE(read_res, 0);
 	snd_pcm_close(handle);
-	it = (unsigned char *)self->samples;
-	for (i = 0; i < self->params.sample_len * self->params.time; i++)
-		ASSERT_EQ(it[i], pattern_buf[i % pattern_len]);
+	it = (unsigned char *)samples;
+	for (i = 0; i < self->params.sec_buf_len * self->params.time; i++) {
+		cur_ch = (i / params->sample_size) % CH_NUM;
+		pos_in_ch = i / params->sample_size / CH_NUM * params->sample_size
+			    + (i % params->sample_size);
+		ASSERT_EQ(it[i], patterns[cur_ch].buf[pos_in_ch % patterns[cur_ch].len]);
+	}
+	free(samples);
 }
 
-// Test capture in the non-interleaved access mode.
+// Test capture in the non-interleaved access mode. The are buffers for each recorded channel
 TEST_F(pcmtest, ni_capture) {
 	snd_pcm_t *handle;
 	struct pcmtest_test_params params = self->params;
-	params.channels = NI_CH;
 	char **chan_samples;
 	size_t i, j, read_res;
+
+	chan_samples = calloc(CH_NUM, sizeof(*chan_samples));
+	ASSERT_NE(chan_samples, NULL);
 
 	snd_pcm_sw_params_alloca(&self->swparams);
 	snd_pcm_hw_params_alloca(&self->hwparams);
@@ -221,9 +253,9 @@ TEST_F(pcmtest, ni_capture) {
 
 	ASSERT_EQ(setup_handle(&handle, self->swparams, self->hwparams,
 			       &params, self->card, SND_PCM_STREAM_CAPTURE), 0);
-	chan_samples = calloc(NI_CH, sizeof(*chan_samples));
-	for (i = 0; i < NI_CH; i++)
-		chan_samples[i] = calloc(params.sample_len * params.time, 1);
+
+	for (i = 0; i < CH_NUM; i++)
+		chan_samples[i] = calloc(params.sec_buf_len * params.time, 1);
 
 	for (i = 0; i < 1; i++) {
 		read_res = snd_pcm_readn(handle, (void **)chan_samples, params.rate * params.time);
@@ -231,9 +263,9 @@ TEST_F(pcmtest, ni_capture) {
 	}
 	snd_pcm_close(handle);
 
-	for(i = 0; i < NI_CH; i++) {
-		for(j = 0; j < params.rate * params.time; j++)
-			ASSERT_EQ(chan_samples[i][j], pattern_buf[j % pattern_len]);
+	for (i = 0; i < CH_NUM; i++) {
+		for (j = 0; j < params.rate * params.time; j++)
+			ASSERT_EQ(chan_samples[i][j], patterns[i].buf[j % patterns[i].len]);
 		free(chan_samples[i]);
 	}
 	free(chan_samples);
@@ -242,10 +274,12 @@ TEST_F(pcmtest, ni_capture) {
 TEST_F(pcmtest, ni_playback) {
 	snd_pcm_t *handle;
 	struct pcmtest_test_params params = self->params;
-	params.channels = NI_CH;
 	char **chan_samples;
 	size_t i, j, read_res;
 	int test_res;
+
+	chan_samples = calloc(CH_NUM, sizeof(*chan_samples));
+	ASSERT_NE(chan_samples, NULL);
 
 	snd_pcm_sw_params_alloca(&self->swparams);
 	snd_pcm_hw_params_alloca(&self->hwparams);
@@ -254,11 +288,11 @@ TEST_F(pcmtest, ni_playback) {
 
 	ASSERT_EQ(setup_handle(&handle, self->swparams, self->hwparams,
 			       &params, self->card, SND_PCM_STREAM_PLAYBACK), 0);
-	chan_samples = calloc(NI_CH, sizeof(*chan_samples));
-	for (i = 0; i < NI_CH; i++) {
-		chan_samples[i] = calloc(params.sample_len * params.time, 1);
-		for (j = 0; j < params.sample_len * params.time; j++)
-			chan_samples[i][j] = pattern_buf[j % pattern_len];
+
+	for (i = 0; i < CH_NUM; i++) {
+		chan_samples[i] = calloc(params.sec_buf_len * params.time, 1);
+		for (j = 0; j < params.sec_buf_len * params.time; j++)
+			chan_samples[i][j] = patterns[i].buf[j % patterns[i].len];
 	}
 
 	for (i = 0; i < 1; i++) {
@@ -270,11 +304,9 @@ TEST_F(pcmtest, ni_playback) {
 	test_res = get_test_results("pc_test");
 	ASSERT_EQ(test_res, 1);
 
-	for(i = 0; i < NI_CH; i++) {
+	for (i = 0; i < CH_NUM; i++)
 		free(chan_samples[i]);
-	}
 	free(chan_samples);
-
 }
 
 /*
