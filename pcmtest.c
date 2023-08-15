@@ -50,6 +50,9 @@
 #define CAPTURE_SUBSTREAM_CNT	8
 #define MAX_CHANNELS_NUM	4
 
+#define DEFAULT_PATTERN		"abacaba"
+#define DEFAULT_PATTERN_LEN	7
+
 #define FILL_MODE_RAND	0
 #define FILL_MODE_PAT	1
 
@@ -64,8 +67,6 @@ static bool inject_prepare_err;
 static bool inject_trigger_err;
 
 static short fill_mode = FILL_MODE_PAT;
-static char fill_pattern[MAX_PATTERN_LEN] = "abacaba";
-static u32 pattern_len = 7;
 
 static u8 playback_capture_test;
 static u8 ioctl_reset_test;
@@ -98,6 +99,7 @@ struct pcmtst_buf_iter {
 	size_t buf_pos;				// position in the DMA buffer
 	size_t period_pos;			// period-relative position
 	size_t b_rw;				// Bytes to write on every timer tick
+	size_t s_rw_ch;				// Samples to write to one channel on every tick
 	unsigned int sample_bytes;		// sample_bits / 8
 	bool is_buf_corrupted;			// playback test result indicator
 	size_t period_bytes;			// bytes in a one period
@@ -107,8 +109,6 @@ struct pcmtst_buf_iter {
 	struct snd_pcm_substream *substream;
 	struct timer_list timer_instance;
 };
-
-static struct pcmtst *pcmtst;
 
 static struct snd_pcm_hardware snd_pcmtst_hw = {
 	.info = (SNDRV_PCM_INFO_INTERLEAVED |
@@ -128,6 +128,14 @@ static struct snd_pcm_hardware snd_pcmtst_hw = {
 	.periods_max =		1024,
 };
 
+struct pattern_buf {
+	char *buf;
+	u32 len;
+};
+
+static int buf_allocated;
+static struct pattern_buf patt_bufs[MAX_CHANNELS_NUM];
+
 static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t bytes)
 {
 	v_iter->total_bytes += by;
@@ -135,9 +143,13 @@ static inline void inc_buf_pos(struct pcmtst_buf_iter *v_iter, size_t by, size_t
 	v_iter->buf_pos %= bytes;
 }
 
-// Position in the DMA buffer when we are in the non-interleaved mode (see below)
-static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int channels,
-				  unsigned int chan_num)
+/*
+ * Position in the DMA buffer when we are in the non-interleaved mode. We increment buf_pos
+ * every time we write a byte to any channel, so the position in the current channel buffer is
+ * (position in the DMA buffer) / count_of_channels + size_of_channel_buf * current_channel
+ */
+static inline size_t buf_pos_n(struct pcmtst_buf_iter *v_iter, unsigned int channels,
+			       unsigned int chan_num)
 {
 	return v_iter->buf_pos / channels + v_iter->chan_block * chan_num;
 }
@@ -147,22 +159,26 @@ static inline size_t buf_pos_nint(struct pcmtst_buf_iter *v_iter, unsigned int c
  * This is (count of samples written for the current channel) * bytes_in_sample +
  * (relative position in the current sample)
  */
-static inline size_t ch_pos_int(size_t b_total, unsigned int channels, unsigned int b_sample)
+static inline size_t ch_pos_i(size_t b_total, unsigned int channels, unsigned int b_sample)
 {
-	return b_total / channels / b_sample * b_sample + b_total % b_sample;
+	return b_total / channels / b_sample * b_sample + (b_total % b_sample);
 }
 
 static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
+	short ch_num;
 	u8 current_byte;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
 		current_byte = runtime->dma_area[v_iter->buf_pos];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[ch_pos_int(v_iter->total_bytes, runtime->channels,
-						 v_iter->sample_bytes) % pattern_len]) {
+		ch_num = (v_iter->total_bytes / v_iter->sample_bytes) % runtime->channels;
+		if (current_byte != patt_bufs[ch_num].buf[ch_pos_i(v_iter->total_bytes,
+								   runtime->channels,
+								   v_iter->sample_bytes)
+							  % patt_bufs[ch_num].len]) {
 			v_iter->is_buf_corrupted = true;
 			break;
 		}
@@ -170,21 +186,22 @@ static void check_buf_block_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_run
 	}
 	// If we broke during the loop, add remaining bytes to the buffer position.
 	inc_buf_pos(v_iter, v_iter->b_rw - i, runtime->dma_bytes);
-
 }
 
 static void check_buf_block_ni(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	unsigned int channels = runtime->channels;
 	size_t i;
+	short ch_num;
 	u8 current_byte;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
-		current_byte = runtime->dma_area[buf_pos_nint(v_iter, channels, i % channels)];
+		current_byte = runtime->dma_area[buf_pos_n(v_iter, channels, i % channels)];
 		if (!current_byte)
 			break;
-		if (current_byte != fill_pattern[(v_iter->total_bytes / channels)
-						 % pattern_len]) {
+		ch_num = i % channels;
+		if (current_byte != patt_bufs[ch_num].buf[(v_iter->total_bytes / channels)
+							  % patt_bufs[ch_num].len]) {
 			v_iter->is_buf_corrupted = true;
 			break;
 		}
@@ -214,42 +231,51 @@ static void check_buf_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runti
  * Here we increment the DMA buffer position every time we write a byte to any channel 'buffer'.
  * We need this to simulate the correct hardware pointer moving.
  */
-static void fill_block_pattern_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_pattern_n(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t i;
 	unsigned int channels = runtime->channels;
+	short ch_num;
 
 	for (i = 0; i < v_iter->b_rw; i++) {
-		runtime->dma_area[buf_pos_nint(v_iter, channels, i % channels)] =
-			fill_pattern[(v_iter->total_bytes / channels) % pattern_len];
+		ch_num = i % channels;
+		runtime->dma_area[buf_pos_n(v_iter, channels, i % channels)] =
+			patt_bufs[ch_num].buf[(v_iter->total_bytes / channels)
+					      % patt_bufs[ch_num].len];
 		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
 	}
 }
 
 // Fill buffer in the interleaved mode. The order of samples is C0, C1, C2, C0, C1, C2, ...
-static void fill_block_pattern_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_pattern_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
-	size_t i;
-	size_t pos_in_ch;
+	size_t sample;
+	size_t pos_in_ch, pos_pattern;
+	short ch, pos_sample;
 
-	for (i = 0; i < v_iter->b_rw; i++) {
-		pos_in_ch = ch_pos_int(v_iter->total_bytes, runtime->channels,
-				       v_iter->sample_bytes);
+	pos_in_ch = ch_pos_i(v_iter->total_bytes, runtime->channels, v_iter->sample_bytes);
 
-		runtime->dma_area[v_iter->buf_pos] = fill_pattern[pos_in_ch % pattern_len];
-		inc_buf_pos(v_iter, 1, runtime->dma_bytes);
+	for (sample = 0; sample < v_iter->s_rw_ch; sample++) {
+		for (ch = 0; ch < runtime->channels; ch++) {
+			for (pos_sample = 0; pos_sample < v_iter->sample_bytes; pos_sample++) {
+				pos_pattern = (pos_in_ch + sample * v_iter->sample_bytes
+					      + pos_sample) % patt_bufs[ch].len;
+				runtime->dma_area[v_iter->buf_pos] = patt_bufs[ch].buf[pos_pattern];
+				inc_buf_pos(v_iter, 1, runtime->dma_bytes);
+			}
+		}
 	}
 }
 
 static void fill_block_pattern(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	if (v_iter->interleaved)
-		fill_block_pattern_int(v_iter, runtime);
+		fill_block_pattern_i(v_iter, runtime);
 	else
-		fill_block_pattern_nint(v_iter, runtime);
+		fill_block_pattern_n(v_iter, runtime);
 }
 
-static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_rand_n(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	unsigned int channels = runtime->channels;
 	// Remaining space in all channel buffers
@@ -259,11 +285,11 @@ static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 	for (i = 0; i < channels; i++) {
 		if (v_iter->b_rw <= bytes_remain) {
 			//b_rw - count of bytes must be written for all channels at each timer tick
-			get_random_bytes(runtime->dma_area + buf_pos_nint(v_iter, channels, i),
+			get_random_bytes(runtime->dma_area + buf_pos_n(v_iter, channels, i),
 					 v_iter->b_rw / channels);
 		} else {
 			// Write to the end of buffer and start from the beginning of it
-			get_random_bytes(runtime->dma_area + buf_pos_nint(v_iter, channels, i),
+			get_random_bytes(runtime->dma_area + buf_pos_n(v_iter, channels, i),
 					 bytes_remain / channels);
 			get_random_bytes(runtime->dma_area + v_iter->chan_block * i,
 					 (v_iter->b_rw - bytes_remain) / channels);
@@ -272,7 +298,7 @@ static void fill_block_rand_nint(struct pcmtst_buf_iter *v_iter, struct snd_pcm_
 	inc_buf_pos(v_iter, v_iter->b_rw, runtime->dma_bytes);
 }
 
-static void fill_block_rand_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
+static void fill_block_rand_i(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	size_t in_cur_block = runtime->dma_bytes - v_iter->buf_pos;
 
@@ -288,9 +314,9 @@ static void fill_block_rand_int(struct pcmtst_buf_iter *v_iter, struct snd_pcm_r
 static void fill_block_random(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
 {
 	if (v_iter->interleaved)
-		fill_block_rand_int(v_iter, runtime);
+		fill_block_rand_i(v_iter, runtime);
 	else
-		fill_block_rand_nint(v_iter, runtime);
+		fill_block_rand_n(v_iter, runtime);
 }
 
 static void fill_block(struct pcmtst_buf_iter *v_iter, struct snd_pcm_runtime *runtime)
@@ -330,7 +356,6 @@ static void timer_timeout(struct timer_list *data)
 		v_iter->period_pos %= v_iter->period_bytes;
 		snd_pcm_period_elapsed(substream);
 	}
-
 	mod_timer(&v_iter->timer_instance, jiffies + TIMER_INTERVAL + inject_delay);
 }
 
@@ -388,7 +413,8 @@ static int snd_pcmtst_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		v_iter->interleaved = true;
 	}
 	// We want to record RATE * ch_cnt samples per sec, it is rate * sample_bytes * ch_cnt bytes
-	v_iter->b_rw = runtime->rate * runtime->sample_bits / 8 / TIMER_PER_SEC * runtime->channels;
+	v_iter->s_rw_ch = runtime->rate / TIMER_PER_SEC;
+	v_iter->b_rw = v_iter->s_rw_ch * v_iter->sample_bytes * runtime->channels;
 
 	return 0;
 }
@@ -524,6 +550,7 @@ _err_free_chip:
 static int pcmtst_probe(struct platform_device *pdev)
 {
 	struct snd_card *card;
+	struct pcmtst *pcmtst;
 	int err;
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
@@ -545,13 +572,16 @@ static int pcmtst_probe(struct platform_device *pdev)
 	if (err < 0)
 		return err;
 
+	platform_set_drvdata(pdev, pcmtst);
+
 	return 0;
 }
 
-static int pdev_remove(struct platform_device *dev)
+static void pdev_remove(struct platform_device *pdev)
 {
+	struct pcmtst *pcmtst = platform_get_drvdata(pdev);
+
 	snd_pcmtst_free(pcmtst);
-	return 0;
 }
 
 static struct platform_device pcmtst_pdev = {
@@ -561,14 +591,15 @@ static struct platform_device pcmtst_pdev = {
 
 static struct platform_driver pcmtst_pdrv = {
 	.probe =	pcmtst_probe,
-	.remove =	pdev_remove,
+	.remove_new =	pdev_remove,
 	.driver =	{
 		.name = "pcmtest",
 	},
 };
 
-static ssize_t pattern_write(struct file *file, const char __user *buff, size_t len, loff_t *off)
+static ssize_t pattern_write(struct file *file, const char __user *u_buff, size_t len, loff_t *off)
 {
+	struct pattern_buf *patt_buf = file->f_inode->i_private;
 	ssize_t to_write = len;
 
 	if (*off + to_write > MAX_PATTERN_LEN)
@@ -578,16 +609,18 @@ static ssize_t pattern_write(struct file *file, const char __user *buff, size_t 
 	if (to_write <= 0)
 		return len;
 
-	if (copy_from_user(fill_pattern + *off, buff, to_write))
+	if (copy_from_user(patt_buf->buf + *off, u_buff, to_write))
 		return -EFAULT;
-	pattern_len = *off + to_write;
+
+	patt_buf->len = *off + to_write;
 	*off += to_write;
 
 	return to_write;
 }
 
-static ssize_t pattern_read(struct file *file, char __user *buff, size_t len, loff_t *off)
+static ssize_t pattern_read(struct file *file, char __user *u_buff, size_t len, loff_t *off)
 {
+	struct pattern_buf *patt_buf = file->f_inode->i_private;
 	ssize_t to_read = len;
 
 	if (*off + to_read >= MAX_PATTERN_LEN)
@@ -595,7 +628,7 @@ static ssize_t pattern_read(struct file *file, char __user *buff, size_t len, lo
 	if (to_read <= 0)
 		return 0;
 
-	if (copy_to_user(buff, fill_pattern + *off, to_read))
+	if (copy_to_user(u_buff, patt_buf->buf + *off, to_read))
 		to_read = 0;
 	else
 		*off += to_read;
@@ -608,17 +641,50 @@ static const struct file_operations fill_pattern_fops = {
 	.write = pattern_write,
 };
 
-static int init_debug_files(void)
+static int setup_patt_bufs(void)
 {
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(patt_bufs); i++) {
+		patt_bufs[i].buf = kzalloc(MAX_PATTERN_LEN, GFP_KERNEL);
+		if (!patt_bufs[i].buf)
+			break;
+		strcpy(patt_bufs[i].buf, DEFAULT_PATTERN);
+		patt_bufs[i].len = DEFAULT_PATTERN_LEN;
+	}
+
+	return i;
+}
+
+static const char * const pattern_files[] = { "fill_pattern0", "fill_pattern1",
+					      "fill_pattern2", "fill_pattern3"};
+static int init_debug_files(int buf_count)
+{
+	size_t i;
+	char len_file_name[32];
+
 	driver_debug_dir = debugfs_create_dir("pcmtest", NULL);
 	if (IS_ERR(driver_debug_dir))
 		return PTR_ERR(driver_debug_dir);
 	debugfs_create_u8("pc_test", 0444, driver_debug_dir, &playback_capture_test);
-	debugfs_create_u32("pattern_len", 0444, driver_debug_dir, &pattern_len);
 	debugfs_create_u8("ioctl_test", 0444, driver_debug_dir, &ioctl_reset_test);
-	debugfs_create_file("fill_pattern", 0600, driver_debug_dir, NULL, &fill_pattern_fops);
+
+	for (i = 0; i < buf_count; i++) {
+		debugfs_create_file(pattern_files[i], 0600, driver_debug_dir,
+				    &patt_bufs[i], &fill_pattern_fops);
+		snprintf(len_file_name, sizeof(len_file_name), "%s_len", pattern_files[i]);
+		debugfs_create_u32(len_file_name, 0444, driver_debug_dir, &patt_bufs[i].len);
+	}
 
 	return 0;
+}
+
+static void free_pattern_buffers(void)
+{
+	int i;
+
+	for (i = 0; i < buf_allocated; i++)
+		kfree(patt_bufs[i].buf);
 }
 
 static void clear_debug_files(void)
@@ -630,7 +696,13 @@ static int __init mod_init(void)
 {
 	int err = 0;
 
-	err = init_debug_files();
+	buf_allocated = setup_patt_bufs();
+	if (!buf_allocated)
+		return -ENOMEM;
+
+	snd_pcmtst_hw.channels_max = buf_allocated;
+
+	err = init_debug_files(buf_allocated);
 	if (err)
 		return err;
 	err = platform_device_register(&pcmtst_pdev);
@@ -645,6 +717,7 @@ static int __init mod_init(void)
 static void __exit mod_exit(void)
 {
 	clear_debug_files();
+	free_pattern_buffers();
 
 	platform_driver_unregister(&pcmtst_pdrv);
 	platform_device_unregister(&pcmtst_pdev);
